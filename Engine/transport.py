@@ -34,23 +34,19 @@ class FileLimit(MediaError):
 
 def public_target(url):
     p=urlsplit(url)
-    if p.scheme not in ('http','https') or not p.hostname or p.username or p.password or p.port not in (None,80,443): raise MediaError('Only public HTTP(S) source URLs on standard ports are supported.')
+    if p.scheme!='https' or not p.hostname or p.username or p.password or p.port not in (None,443): raise MediaError('Only public HTTPS source URLs on the standard port are supported.')
     if any(ord(c)<33 for c in url) or '\\' in url: raise MediaError('Malformed source URL.')
-    addresses=socket.getaddrinfo(p.hostname,p.port or (443 if p.scheme=='https' else 80),type=socket.SOCK_STREAM)
+    addresses=socket.getaddrinfo(p.hostname,p.port or 443,type=socket.SOCK_STREAM)
     if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses): raise MediaError('Private, local, reserved or mixed DNS destinations are blocked.')
     return p,addresses[0][4][0]
 
 class PinnedHTTPS(http.client.HTTPSConnection):
     def __init__(self,host,ip,port): super().__init__(host,port,timeout=15,context=ssl.create_default_context()); self.ip=ip
     def connect(self): self.sock=self._context.wrap_socket(socket.create_connection((self.ip,self.port),self.timeout),server_hostname=self.host)
-class PinnedHTTP(http.client.HTTPConnection):
-    def __init__(self,host,ip,port): super().__init__(host,port,timeout=15); self.ip=ip
-    def connect(self): self.sock=socket.create_connection((self.ip,self.port),self.timeout)
-
 def response(url):
     for _ in range(6):
-        p,ip=public_target(url); cls=PinnedHTTPS if p.scheme=='https' else PinnedHTTP
-        conn=cls(p.hostname,ip,p.port or (443 if p.scheme=='https' else 80))
+        p,ip=public_target(url)
+        conn=PinnedHTTPS(p.hostname,ip,p.port or 443)
         try:
             conn.request('GET',(p.path or '/')+('?' +p.query if p.query else ''),headers={'User-Agent':'TrackerPlayer/1.0','Accept-Encoding':'identity','Connection':'close'})
             r=conn.getresponse()

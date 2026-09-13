@@ -62,7 +62,7 @@ class SnapshotCatalog:
         rows = c.get('rows', [])
         if not rows or len({r['id'] for r in rows}) != len(rows): raise Problem('invalid_identity', 'Source IDs must be present and unique.')
         for r in rows:
-            for k in ('id','workbook','era','title','name','sourceHash','sourceUrl','fields','links'): 
+            for k in ('id','workbook','era','title','name','sourceHash','sourceUrl','fields','links'):
                 if k not in r: raise Problem('invalid_row', 'Missing source field: ' + k)
             if not isinstance(r['id'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}',r['id']):
                 raise Problem('invalid_identity','Source identity contains unsafe file-name characters.')
@@ -226,7 +226,8 @@ class Engine(DeliveryMixin):
                 if part.exists():part.unlink()
 
     def summary(self,r):
-        return {k:r[k] for k in ('id','workbook','era','title','name','version','kind','source_row','ambiguous','eligible')} | {'availability':r['availability'] or 'remote','bytes':r['file_bytes'] or 0,'fields':{k:v for k,v in json.loads(r['payload']).get('fields',{}).items() if k in ('Available Length','Quality','Track Length','Length')}}
+        payload=json.loads(r['payload'])
+        return {k:r[k] for k in ('id','workbook','era','title','name','version','kind','source_row','ambiguous','eligible')} | {'availability':r['availability'] or 'remote','bytes':r['file_bytes'] or 0,'sourceCount':len(payload.get('links',[])),'fields':{k:v for k,v in payload.get('fields',{}).items() if k in ('Available Length','Quality','Track Length','Length')}}
     def where(self,p):
         clauses=[];args=[]
         for key in ('workbook','era','kind'):
@@ -362,7 +363,7 @@ class Engine(DeliveryMixin):
             except transport.FileLimit as e:
                 return {'approval':self.size_request(r,url,e)}
             except Exception as e:
-                with self.transaction():self.event('source_failure',r['id'],{'source':url,'message':str(e)})
+                with self.transaction():self.event('source_failure',r['id'],public_record({'source':url,'message':str(e)}))
                 raise
             finally:
                 if part.exists():part.unlink()
@@ -634,7 +635,18 @@ class Engine(DeliveryMixin):
             raise
     def manifest(self,p):
         with self.lock:
-            payload={'schema':1,'source':self.catalog['sourceUrl'],'revision':self.catalog['snapshotHash'],'files':[dict(x) for x in self.db.execute('SELECT * FROM files')],'exports':[dict(x) for x in self.db.execute('SELECT * FROM exports')],'events':[dict(x) for x in self.db.execute('SELECT * FROM events')]}
+            def safe_rows(table):
+                rows=[]
+                for stored in self.db.execute('SELECT * FROM '+table):
+                    item=dict(stored)
+                    for key in ('record','proof','metadata','payload'):
+                        raw=item.get(key)
+                        if isinstance(raw,str):
+                            try:item[key]=encode(public_record(json.loads(raw)))
+                            except (TypeError,ValueError):item[key]=public_record(raw)
+                    rows.append(public_record(item))
+                return rows
+            payload=public_record({'schema':1,'source':self.catalog['sourceUrl'],'revision':self.catalog['snapshotHash'],'files':safe_rows('files'),'exports':safe_rows('exports'),'events':safe_rows('events')})
             path=contained(self.root/'Exports','Library Manifest.json');atomic_json(path,payload)
         return {'path':str(path)}
     def session(self,p):self.setpref('session',p);return {'ok':True}
