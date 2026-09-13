@@ -363,7 +363,7 @@ class Engine(DeliveryMixin):
             except transport.FileLimit as e:
                 return {'approval':self.size_request(r,url,e)}
             except Exception as e:
-                with self.transaction():self.event('source_failure',r['id'],{'source':url,'message':str(e)})
+                with self.transaction():self.event('source_failure',r['id'],public_record({'source':url,'message':str(e)}))
                 raise
             finally:
                 if part.exists():part.unlink()
@@ -635,7 +635,18 @@ class Engine(DeliveryMixin):
             raise
     def manifest(self,p):
         with self.lock:
-            payload={'schema':1,'source':self.catalog['sourceUrl'],'revision':self.catalog['snapshotHash'],'files':[dict(x) for x in self.db.execute('SELECT * FROM files')],'exports':[dict(x) for x in self.db.execute('SELECT * FROM exports')],'events':[dict(x) for x in self.db.execute('SELECT * FROM events')]}
+            def safe_rows(table):
+                rows=[]
+                for stored in self.db.execute('SELECT * FROM '+table):
+                    item=dict(stored)
+                    for key in ('record','proof','metadata','payload'):
+                        raw=item.get(key)
+                        if isinstance(raw,str):
+                            try:item[key]=encode(public_record(json.loads(raw)))
+                            except (TypeError,ValueError):item[key]=public_record(raw)
+                    rows.append(public_record(item))
+                return rows
+            payload=public_record({'schema':1,'source':self.catalog['sourceUrl'],'revision':self.catalog['snapshotHash'],'files':safe_rows('files'),'exports':safe_rows('exports'),'events':safe_rows('events')})
             path=contained(self.root/'Exports','Library Manifest.json');atomic_json(path,payload)
         return {'path':str(path)}
     def session(self,p):self.setpref('session',p);return {'ok':True}

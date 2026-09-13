@@ -33,6 +33,13 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(transport.classify_http(503),'network_failure')
         self.assertEqual(transport.classify_page(b'<input type="password">'),'authentication_required')
         self.assertEqual(transport.classify_page(b'<html>temporarily unavailable</html>'),'access_unavailable')
+    def test_transport_requires_https_before_dns(self):
+        with patch('transport.socket.getaddrinfo') as lookup:
+            with self.assertRaises(transport.MediaError):transport.public_target('http://example.com/file.mp3')
+        lookup.assert_not_called()
+        with patch('transport.socket.getaddrinfo',return_value=[(2,1,6,'',('93.184.216.34',443))]):
+            parsed,ip=transport.public_target('https://example.com/file.mp3')
+        self.assertEqual(parsed.scheme,'https');self.assertEqual(ip,'93.184.216.34')
     def test_full_era_continues_deduplicates_and_makes_zero_link_placeholder(self):
         self.e.settings({'count':1})
         def fetch(url,*args,**kwargs):
@@ -99,6 +106,17 @@ class DeliveryTests(unittest.TestCase):
         r=dict(self.rows[2],links=['https://example.com/file?token=do-not-export'],fields={'Notes':'password=do-not-export','Cookie':'private','Year':'2024'})
         j=self.e.enqueue({'ids':['none']})['jobs'][0];result=self.e.placeholder(r,j,'no_source','authorization=do-not-export')
         text=Path(result['path']).read_text();self.assertNotIn('do-not-export',text);self.assertNotIn('private',text);self.assertIn('2024',text)
+    def test_failure_events_and_manifest_redact_signed_queries(self):
+        signed='https://example.com/file?token=do-not-export&signature=private'
+        signed_row=dict(self.rows[0],links=[signed])
+        with self.assertRaises(transport.AccessError),patch.object(self.e,'row',return_value=signed_row),patch('transport.download',side_effect=transport.AccessError('broken_source','Failed '+signed)):
+            self.e.prepare({'id':'a'})
+        event=self.e.db.execute("SELECT payload FROM events WHERE type='source_failure'").fetchone()['payload']
+        self.assertNotIn('do-not-export',event);self.assertNotIn('private',event);self.assertIn('%5Bredacted%5D',event)
+        # Simulate a pre-fix database row so manifest export also protects historical state.
+        with self.e.transaction():self.e.event('source_failure','a',{'source':signed,'session':'private'})
+        manifest=Path(self.e.manifest({})['path']).read_text()
+        self.assertNotIn('do-not-export',manifest);self.assertNotIn('private',manifest);self.assertNotIn('session',manifest)
     def test_art_precedence_and_group_uniqueness(self):
         image=self.base/'cover.png';image.write_bytes(PNG)
         self.e.assign_art({'rowId':'a','path':str(image),'scope':'group'})

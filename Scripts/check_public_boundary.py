@@ -38,6 +38,10 @@ for path in ROOT.rglob('*'):
 for required in ('README.md','SECURITY.md','CONTRIBUTING.md'):
     if REQUIRED_WARNING not in (ROOT/required).read_text('utf-8').lower():
         errors.append(f'{required}: missing universal untrusted-data warning')
+workflow=(ROOT/'.github/workflows/ci.yml').read_text('utf-8')
+for line in workflow.splitlines():
+    if 'uses:' in line and not re.search(r'uses:\s*[^@]+@[0-9a-f]{40}(?:\s|$)',line):
+        errors.append('.github/workflows/ci.yml: executable action is not pinned to a full commit SHA')
 if errors:
     print('\n'.join(errors),file=sys.stderr);raise SystemExit(1)
 print('Public boundary check passed.')
