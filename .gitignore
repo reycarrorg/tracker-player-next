@@ -1,0 +1,12 @@
+.DS_Store
+.venv/
+Build/
+__pycache__/
+*.pyc
+*.app/
+*.zip
+Library.sqlite*
+Downloads/
+Exports/
+Cache/
+Artwork/
