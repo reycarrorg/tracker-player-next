@@ -25,13 +25,14 @@ extension Color {
 struct Track: Identifiable, Hashable {
     let id: String, title: String, name: String, era: String, workbook: String, version: String, kind: String, availability: String
     let availableLength: String, quality: String, trackLength: String
-    let sourceRow: Int
+    let sourceRow: Int, sourceCount: Int
     let ambiguous: Bool, eligible: Bool
     init(_ o: Object) {
         id=string(o,"id"); title=string(o,"title"); name=string(o,"name",string(o,"title")); era=string(o,"era"); workbook=string(o,"workbook"); version=string(o,"version"); kind=string(o,"kind"); availability=string(o,"availability","remote")
         let fields=o["fields"] as? Object ?? [:]
         availableLength=string(fields,"Available Length");quality=string(fields,"Quality");trackLength=string(fields,"Track Length").isEmpty ? string(fields,"Length"):string(fields,"Track Length")
         sourceRow=number(o,"source_row") > 0 ? number(o,"source_row") : number(o,"row")
+        sourceCount=number(o,"sourceCount")
         ambiguous=(o["ambiguous"] as? Bool) ?? (number(o,"ambiguous") != 0)
         eligible=(o["eligible"] as? Bool) ?? (number(o,"eligible") != 0)
     }
@@ -247,6 +248,8 @@ func decodedArtwork(_ path:String) -> NSImage? {
     @Published var notice=""
     @Published var failure=""
     var sizePromptActive=false
+    var selectedDownloadIDs:[String] {tracks.filter{selection.contains($0.id) && sourceIndicator(sourceCount:$0.sourceCount,availability:$0.availability,ambiguous:$0.ambiguous,eligible:$0.eligible).canDownload}.map(\.id)}
+    func downloadable(_ ids:Set<String>)->[String] {tracks.filter{ids.contains($0.id) && sourceIndicator(sourceCount:$0.sourceCount,availability:$0.availability,ambiguous:$0.ambiguous,eligible:$0.eligible).canDownload}.map(\.id)}
     @Published var root=""
     var playbackIDs:[String]=[]
     var currentPath=""
@@ -700,7 +703,7 @@ struct ContentView:View {
                     VStack(alignment:.leading,spacing:6){Eyebrow(text:"Era notes");ScrollView{Text(e.description).font(.callout).foregroundStyle(.secondary).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading)}}.frame(maxHeight:100).padding(.horizontal,22).padding(.bottom,12)
                 }
             }
-            HStack(spacing:12){Text("\(model.total.formatted()) results").font(.system(size:12,weight:.semibold)).monospacedDigit();if model.busy{ProgressView().controlSize(.small)};Spacer();Picker("Media",selection:Binding(get:{model.kind},set:{model.chooseKind($0)})){Text("All assets").tag("");Text("Audio").tag("audio");Text("Video").tag("video");Text("Other").tag("other")}.labelsHidden().frame(width:110);Picker("Availability",selection:Binding(get:{model.filter},set:{model.chooseFilter($0)})){Text("All states").tag("all");Text("Local files").tag("local");Text("Missing / changed").tag("missing");Text("Ambiguous identity").tag("ambiguous");Text("Playable rows").tag("playable")}.labelsHidden().frame(width:150);if !model.selection.isEmpty{Button{Task{await model.download(Array(model.selection))}}label:{Label("Save \(model.selection.count)",systemImage:"arrow.down.circle")}}}.padding(.horizontal,22).padding(.vertical,12)
+            HStack(spacing:12){Text("\(model.total.formatted()) results").font(.system(size:12,weight:.semibold)).monospacedDigit();if model.busy{ProgressView().controlSize(.small)};Spacer();Picker("Media",selection:Binding(get:{model.kind},set:{model.chooseKind($0)})){Text("All assets").tag("");Text("Audio").tag("audio");Text("Video").tag("video");Text("Other").tag("other")}.labelsHidden().frame(width:110);Picker("Availability",selection:Binding(get:{model.filter},set:{model.chooseFilter($0)})){Text("All states").tag("all");Text("Local files").tag("local");Text("Missing / changed").tag("missing");Text("Ambiguous identity").tag("ambiguous");Text("Playable rows").tag("playable")}.labelsHidden().frame(width:150);if !model.selectedDownloadIDs.isEmpty{Button{Task{await model.download(model.selectedDownloadIDs)}}label:{Label("Save \(model.selectedDownloadIDs.count)",systemImage:"arrow.down.circle")}}}.padding(.horizontal,22).padding(.vertical,12)
             if model.tracks.isEmpty && !model.busy {ContentUnavailableViewCompat(title:"No matching rows",detail:"Try a different era, search or availability filter.",symbol:"magnifyingglass")}
             else {
                 List(selection:Binding(get:{model.selection},set:{model.selectRows($0)})) {
@@ -715,7 +718,8 @@ struct ContentView:View {
                     if let id=ids.first {
                         Button("Play"){Task{await model.play(id)}}
                         Button("Inspect source"){model.selectRows([id]);model.setInspector(true)}
-                        Button("Save selected"){Task{await model.download(Array(ids))}}
+                        let downloadable=model.downloadable(ids)
+                        if !downloadable.isEmpty {Button("Save selected"){Task{await model.download(downloadable)}}}
                     }
                 } primaryAction:{ids in if let id=ids.first{Task{await model.play(id)}}}
                 if model.tracks.count<model.total {Button("Load next \(min(500,model.total-model.tracks.count)) rows · \(model.tracks.count.formatted()) loaded of \(model.total.formatted())"){Task{await model.reload(more:true)}}.buttonStyle(.borderless).padding(10)}
@@ -796,8 +800,7 @@ struct SongRow:View {
     let track:Track
     var fill:String {model.eraBackground(track.era)}
     var ink:Color {eraUsesDarkText(fill) ? .black:.white}
-    var state:String {track.ambiguous ? "Source needs review":track.availability=="available" ? "Saved locally":track.availability=="missing" || track.availability=="changed" ? "Local file missing or changed":track.eligible ? "Remote source · download to play":"No playable source"}
-    var statusIcon:String {track.ambiguous ? "exclamationmark.triangle":track.availability=="available" ? "checkmark.icloud":track.availability=="missing" || track.availability=="changed" ? "exclamationmark.icloud":track.eligible ? "icloud.and.arrow.down":"icloud.slash"}
+    var source:SourceIndicator {sourceIndicator(sourceCount:track.sourceCount,availability:track.availability,ambiguous:track.ambiguous,eligible:track.eligible)}
     func tag(_ text:String,icon:String,label:String)->some View {Label(text,systemImage:icon).font(.system(size:10,weight:.semibold)).lineLimit(1).padding(.horizontal,8).padding(.vertical,4).background(ink.opacity(0.10),in:Capsule()).help(label+": "+text).accessibilityLabel(label+": "+text)}
     var body:some View {
         HStack(spacing:14) {
@@ -811,7 +814,7 @@ struct SongRow:View {
                 tag(track.quality.isEmpty ? "Not specified":track.quality,icon:"slider.horizontal.3",label:"Source quality")
             }.frame(width:158,alignment:.leading)
             Label(track.trackLength.isEmpty ? "—":track.trackLength,systemImage:"clock").font(.system(size:11,weight:.medium,design:.monospaced)).lineLimit(2).frame(width:84,alignment:.leading).help("Tracker duration: \(track.trackLength.isEmpty ? "unknown":track.trackLength)")
-            Image(systemName:statusIcon).font(.system(size:16)).frame(width:24).help(state).accessibilityLabel(state)
+            if let icon=source.icon {Image(systemName:icon).font(.system(size:16)).frame(width:24).help(source.label).accessibilityLabel(source.label)}
             Image(systemName:model.selection.contains(track.id) ? "checkmark.circle.fill":"circle").opacity(model.selection.contains(track.id) ? 1:0.35).frame(width:18)
         }.foregroundStyle(ink).padding(.horizontal,14).padding(.vertical,9)
         .frame(maxWidth:.infinity,alignment:.leading).background(Color(hex:fill))
@@ -852,7 +855,9 @@ struct Inspector:View {
             }
             ArtworkAttribution(model:model,era:string(row,"era"))
             HStack {
-                Button("Save selected source"){Task{await model.download([string(row,"id")])}}
+                if !(row["links"] as? [String] ?? []).isEmpty,(row["eligible"] as? Bool) == true,(row["ambiguous"] as? Bool) != true {
+                    Button("Save selected source"){Task{await model.download([string(row,"id")])}}
+                }
                 Button("Open tracker row"){model.openSource(string(row,"sourceUrl"))}
             }.controlSize(.small)
             Text(string(row,"name")).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
@@ -977,7 +982,7 @@ final class AppDelegate:NSObject,NSApplicationDelegate {
                     Divider();Button("Reveal Playing"){Task{await Library.shared.revealPlaying()}}.keyboardShortcut("l",modifiers:.command)
                 }
                 CommandMenu("Library"){
-                    Button("Save Selected Rows"){Task{await Library.shared.download(Array(Library.shared.selection))}}.keyboardShortcut("d",modifiers:.command)
+                    Button("Save Selected Rows"){Task{await Library.shared.download(Library.shared.selectedDownloadIDs)}}.keyboardShortcut("d",modifiers:.command).disabled(Library.shared.selectedDownloadIDs.isEmpty)
                     Button("Transfers & Exports"){Library.shared.navigateSection("transfers")}.keyboardShortcut("j",modifiers:.command)
                     Button("Show App Data"){Library.shared.reveal(Library.shared.root)}
                 }

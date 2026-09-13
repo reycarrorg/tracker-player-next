@@ -23,7 +23,14 @@ class SongRows(unittest.TestCase):
     def test_rows_keep_original_tags(self):
         rows=self.e.query({'limit':500})['rows'];short=next(r for r in rows if r['id']=='short')
         self.assertEqual(short['fields'],self.rows[0]['fields']);self.assertEqual(short['version'],'[v1]')
+        self.assertEqual(short['sourceCount'],1)
         self.assertEqual(self.e.detail({'id':'short'})['row']['fields'],short['fields'])
+    def test_zero_link_summary_has_no_remote_source(self):
+        self.e.catalog['rows'][0]['links']=[]
+        with self.e.transaction():
+            self.e.db.execute('UPDATE rows SET payload=? WHERE id=?',(json.dumps(self.e.catalog['rows'][0]),'short'))
+        short=self.e.query({'limit':500})['rows'][0]
+        self.assertEqual(short['sourceCount'],0)
     def test_full_scope_beyond_page(self):
         self.e.catalog['rows']=[row(str(i),fields={'Length':'0:10' if i%2 else '2:00'}) for i in range(1200)]
         result=self.e.shuffle_candidates({'ids':[str(i) for i in range(1200)],'skipShort':True})

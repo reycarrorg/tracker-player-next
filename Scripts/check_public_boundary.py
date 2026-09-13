@@ -19,7 +19,7 @@ REQUIRED_WARNING='untrusted data'
 
 errors=[]
 for path in ROOT.rglob('*'):
-    if '.git' in path.parts or path.is_symlink() or not path.is_file():
+    if any(part in {'.git','Build','.venv','__pycache__'} for part in path.parts) or path.is_symlink() or not path.is_file():
         continue
     relative=path.relative_to(ROOT)
     if path.name in FORBIDDEN_NAMES:

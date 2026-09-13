@@ -62,7 +62,7 @@ class SnapshotCatalog:
         rows = c.get('rows', [])
         if not rows or len({r['id'] for r in rows}) != len(rows): raise Problem('invalid_identity', 'Source IDs must be present and unique.')
         for r in rows:
-            for k in ('id','workbook','era','title','name','sourceHash','sourceUrl','fields','links'): 
+            for k in ('id','workbook','era','title','name','sourceHash','sourceUrl','fields','links'):
                 if k not in r: raise Problem('invalid_row', 'Missing source field: ' + k)
             if not isinstance(r['id'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}',r['id']):
                 raise Problem('invalid_identity','Source identity contains unsafe file-name characters.')
@@ -226,7 +226,8 @@ class Engine(DeliveryMixin):
                 if part.exists():part.unlink()
 
     def summary(self,r):
-        return {k:r[k] for k in ('id','workbook','era','title','name','version','kind','source_row','ambiguous','eligible')} | {'availability':r['availability'] or 'remote','bytes':r['file_bytes'] or 0,'fields':{k:v for k,v in json.loads(r['payload']).get('fields',{}).items() if k in ('Available Length','Quality','Track Length','Length')}}
+        payload=json.loads(r['payload'])
+        return {k:r[k] for k in ('id','workbook','era','title','name','version','kind','source_row','ambiguous','eligible')} | {'availability':r['availability'] or 'remote','bytes':r['file_bytes'] or 0,'sourceCount':len(payload.get('links',[])),'fields':{k:v for k,v in payload.get('fields',{}).items() if k in ('Available Length','Quality','Track Length','Length')}}
     def where(self,p):
         clauses=[];args=[]
         for key in ('workbook','era','kind'):
