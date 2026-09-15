@@ -33,6 +33,23 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(transport.classify_http(503),'network_failure')
         self.assertEqual(transport.classify_page(b'<input type="password">'),'authentication_required')
         self.assertEqual(transport.classify_page(b'<html>temporarily unavailable</html>'),'access_unavailable')
+    def test_easy_attached_source_is_tried_before_login_source(self):
+        soundcloud='https://soundcloud.com/artist/song';pillow='https://pillows.su/f/'+'a'*32
+        chosen=[]
+        def fetch(url,*args,**kwargs):
+            chosen.append(url)
+            if url==soundcloud:raise transport.AccessError('authentication_required','Sign in.')
+            return self.fake(url,*args,**kwargs)
+        linked=row('a',links=[soundcloud,pillow])
+        with patch.object(self.e,'row',return_value=linked),patch('transport.download',side_effect=fetch):
+            job=self.e.enqueue({'ids':['a']})['jobs'][0];self.e.run_job(job)
+        self.assertEqual(chosen,[pillow]);self.assertEqual(self.job(job)['state'],'completed')
+    def test_preview_uses_same_easy_source_order(self):
+        soundcloud='https://soundcloud.com/artist/song';pillow='https://pillows.su/f/'+'b'*32
+        linked=row('a',links=[soundcloud,pillow]);chosen=[]
+        def fetch(url,*args,**kwargs):chosen.append(url);return self.fake(url,*args,**kwargs)
+        with patch.object(self.e,'row',return_value=linked),patch('transport.download',side_effect=fetch):result=self.e.prepare({'id':'a','remote':True})
+        self.assertEqual(chosen,[pillow]);self.assertEqual(result['kind'],'audio')
     def test_transport_requires_https_before_dns(self):
         with patch('transport.socket.getaddrinfo') as lookup:
             with self.assertRaises(transport.MediaError):transport.public_target('http://example.com/file.mp3')
@@ -53,7 +70,8 @@ class DeliveryTests(unittest.TestCase):
         record=self.e.local('a');self.assertEqual(Path(record['path']).parent,self.e.root/'Downloads/Suzy Tracker/Unreleased/Era')
         self.assertEqual(Path(record['path']).name,'Song a [V1] [Snippet].wav')
         self.assertEqual(json.loads(record['record'])['tags']['album'],'Era [Unreleased]')
-        self.assertEqual(self.e.activity({})['batches'][0]['total'],4)
+        batch=self.e.activity({})['batches'][0]
+        self.assertEqual(batch['total'],4);self.assertEqual(batch['label'],'Unreleased / Era')
     def test_auth_open_retry_and_unresolved_same_source(self):
         j=self.e.enqueue({'ids':['auth']})['jobs'][0]
         with patch('transport.download',side_effect=transport.AccessError('authentication_required','Sign in.')):self.e.run_job(j)
@@ -113,7 +131,6 @@ class DeliveryTests(unittest.TestCase):
             self.e.prepare({'id':'a'})
         event=self.e.db.execute("SELECT payload FROM events WHERE type='source_failure'").fetchone()['payload']
         self.assertNotIn('do-not-export',event);self.assertNotIn('private',event);self.assertIn('%5Bredacted%5D',event)
-        # Simulate a pre-fix database row so manifest export also protects historical state.
         with self.e.transaction():self.e.event('source_failure','a',{'source':signed,'session':'private'})
         manifest=Path(self.e.manifest({})['path']).read_text()
         self.assertNotIn('do-not-export',manifest);self.assertNotIn('private',manifest);self.assertNotIn('session',manifest)

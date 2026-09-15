@@ -4,4 +4,4 @@ The public codebase was extracted from the Tracker Player Next development line 
 
 The publication candidate reconciles that later source rather than presenting 1.3.0 as current. Private catalog adapters, captured data, artwork, historical evidence, user media, and machine-specific build paths were excluded. The public adapter validates the snapshot schema and source URL without embedding the private sheet identity.
 
-Version 1.4.0 identifies the coherent local application candidate and public source migration. It is not a GitHub binary release or tag.
+Version 1.5.0 identifies the coherent local application candidate and public source migration. It adds attached-source fallback ordering, exact worksheet-era artwork identities and progress, and the revised source browser and inspector. It is not a GitHub binary release or tag.

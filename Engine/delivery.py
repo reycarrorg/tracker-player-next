@@ -74,7 +74,7 @@ class DeliveryMixin:
         # Do not apply the visible search, media filter, or page limit to Download All.
         ids=self.ids({'workbook':p['workbook'],'era':p['era']})
         if not ids:raise Problem('empty_era','This era has no requested rows.')
-        return self.enqueue({'ids':ids,'allEra':True})
+        return self.enqueue({'ids':ids,'allEra':True,'workbook':p['workbook'],'era':p['era']})
 
     def retry_batch(self,p):
         from engine import Problem
@@ -93,18 +93,18 @@ class DeliveryMixin:
             self.pool.submit(self.run_job,job['id'])
         return {'ok':True}
 
-    def recovery_failure(self,row,job,error):
+    def recovery_failure(self,row,job,error,source='',attempts=None):
         code=classification(error);reason=public_record(str(error))
-        self.setpref('delivery:'+job['id'],{'classification':code,'reason':reason})
+        self.setpref('delivery:'+job['id'],{'classification':code,'reason':reason,'source':source,'attempts':public_record(attempts or [])})
         if code=='no_source':self.placeholder(row,job['id'],code,reason)
         elif code in ('authentication_required','access_unavailable'):
             self.job_update(job['id'],state='awaiting_access',code=code,error=reason+' Open the provider, attach a manually downloaded file, retry this source, or create a placeholder.')
         elif code=='broken_source':self.placeholder(row,job['id'],code,reason)
         else:self.job_update(job['id'],state='failed',code=code,error=reason)
 
-    def request_asset(self,row,path,limit,**kwargs):
+    def request_asset(self,row,path,limit,source=None,**kwargs):
         """Serialize identical URLs; reuse payloads from completed registry entries."""
-        source=row['links'][0]
+        source=source or row['links'][0]
         canonical=source
         parsed=urlsplit(source)
         if parsed.hostname in ('pillows.su','www.pillows.su'):
@@ -186,7 +186,7 @@ class DeliveryMixin:
         if not row_selection and row['id']!='__group__' and row.get('title')!=row['era']:
             candidate=self.adapter.matching_art(row['era'],row.get('title',''))
             if candidate:
-                for selection in self.adapter.bundled_art.eras.values():
+                for selection in self.adapter.bundled_art.groups.values():
                     if selection.get('sourceRowId')==candidate['rowId']:
                         path=self.adapter.bundled_art.path(selection['assetId'])
                         if path and Path(path).read_bytes().startswith((b'\xff\xd8\xff',b'\x89PNG\r\n\x1a\n')):
@@ -205,7 +205,7 @@ class DeliveryMixin:
                 if reused:return {'reason':'Duplicate artwork across non-Released worksheet-era groups.','missing':True}
             return dict(selected,path=str(path),rowId='assigned-'+selected['sha256'],exportEligible=True,bundled=False)
         # Only provider-backed album metadata can automatically qualify as official.
-        selection=self.adapter.bundled_art.for_era(row['era'])
+        selection=self.adapter.bundled_art.for_group(row['workbook'],row['era'])
         if row['workbook']=='Released' and selection and selection.get('association')=='album_metadata':
             path=self.adapter.bundled_art.path(selection['assetId'])
             return dict(selection,path=path,exportEligible=True,official=True)

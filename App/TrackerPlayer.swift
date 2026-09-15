@@ -55,10 +55,10 @@ enum EraPalette {
     }()
 }
 struct Era: Identifiable {
-    let name: String, count: Int, description: String, timeline: String, artID: String, color: String, background: String
+    let name: String, count: Int, downloaded: Int, description: String, timeline: String, artID: String, color: String, background: String
     var id: String { name }
     init(_ o: Object) {
-        name=string(o,"name");count=number(o,"count")
+        name=string(o,"name");count=number(o,"count");downloaded=number(o,"downloaded")
         let meta=o["metadata"] as? Object ?? [:], art=o["artwork"] as? Object ?? [:], colors=meta["colors"] as? Object ?? EraPalette.colors[name] ?? [:]
         description=string(meta,"description"); timeline=string(meta,"timeline")
         artID=string(art,"rowId");color=string(colors,"accent","DFB77F");background=string(colors,"background",string(EraPalette.colors[name] ?? [:],"background","27262A"))
@@ -74,15 +74,19 @@ func decodedArtwork(_ path:String) -> NSImage? {
 
 @MainActor final class BundledArtwork {
     let directory:URL
-    var eras:[String:Object]=[:], assets:[String:Object]=[:]
+    var groups:[String:Object]=[:], assets:[String:Object]=[:]
     private var images:[String:NSImage]=[:]
     init() {
         directory=Bundle.main.resourceURL!.appendingPathComponent("Engine/Artwork")
         if let data=try? Data(contentsOf:directory.appendingPathComponent("manifest.json")),let manifest=(try? JSONSerialization.jsonObject(with:data)) as? Object {
-            eras=manifest["eras"] as? [String:Object] ?? [:];assets=manifest["assets"] as? [String:Object] ?? [:]
+            groups=manifest["groups"] as? [String:Object] ?? [:];assets=manifest["assets"] as? [String:Object] ?? [:]
         }
     }
-    func selection(_ era:String)->Object {eras[era] ?? [:]}
+    func key(_ workbook:String,_ era:String)->String {
+        guard let data=try? JSONSerialization.data(withJSONObject:[workbook,era]),let value=String(data:data,encoding:.utf8) else{return ""}
+        return value
+    }
+    func selection(_ workbook:String,_ era:String)->Object {groups[key(workbook,era)] ?? [:]}
     func image(id:String)->NSImage? {
         if let image=images[id]{return image}
         guard let asset=assets[id] else{return nil}
@@ -90,7 +94,7 @@ func decodedArtwork(_ path:String) -> NSImage? {
         guard !file.isEmpty,!file.contains("/"),!file.contains(".."),let image=decodedArtwork(directory.appendingPathComponent(file).path) else{return nil}
         images[id]=image;return image
     }
-    func image(era:String)->NSImage? {image(id:string(selection(era),"assetId"))}
+    func image(workbook:String,era:String)->NSImage? {image(id:string(selection(workbook,era),"assetId"))}
 }
 
 @MainActor final class Worker {
@@ -212,7 +216,7 @@ func decodedArtwork(_ path:String) -> NSImage? {
     @Published var detail:Object=[:]
     @Published var inspectedFilePath=""
     @Published var inspectedFileID=""
-    @Published var inspector=false
+    @Published var inspector=true
     @Published var navigation=NavigationTrail()
     @Published var restoringNavigation=false
     var navigationGeneration=0
@@ -302,6 +306,7 @@ func decodedArtwork(_ path:String) -> NSImage? {
             let session=boot["session"] as? Object ?? [:]
             worksheet=string(session,"workbook","Unreleased");era=string(session,"era");volume=min(1,max(0,session["volume"] as? Double ?? 0.8));player.volume=Float(volume)
             skipShort=session["skipShort"] as? Bool ?? false;includeUnknown=session["includeUnknown"] as? Bool ?? true;avoidRepeats=session["avoidRepeats"] as? Bool ?? true
+            inspector=true
             shuffle=session["shuffle"] as? Bool ?? false;repeatMode=string(session,"repeat","off")
             shuffleCycle=Set(session["shuffleCycle"] as? [String] ?? [])
             playbackIDs=session["scopeIDs"] as? [String] ?? [];playbackScope=string(session,"scopeLabel","Restored recording · choose a scope to continue")
@@ -522,6 +527,7 @@ func decodedArtwork(_ path:String) -> NSImage? {
                 let allow=await confirmLargeFile(approval,preview:false)
                 _ = try await object("size_decision",["id":string(job,"id"),"allow":allow])
             }
+            await loadEras()
         }catch{failure=error.localizedDescription}
     }
     func refreshStats() async {do{stats=try await object("stats",healthScope=="all" ? [:]:healthScope=="worksheet" ? ["workbook":worksheet]:["workbook":worksheet,"era":era])}catch{failure=error.localizedDescription}}
@@ -576,9 +582,9 @@ func decodedArtwork(_ path:String) -> NSImage? {
 
 struct Cover: View {
     @ObservedObject var model:Library
-    var id:String="",era:String="",size:CGFloat=64,color:Color=Color(hex:"DFB77F")
-    var image:NSImage? {model.covers[id] ?? model.bundledArtwork.image(id:id) ?? nil}
-    var caption:String {image == nil ? "Artwork assignment needed":id.hasPrefix("assigned-") ? "User-assigned artwork":model.covers[id] != nil && !id.hasPrefix("bundle-") ? "Recording artwork from its exact tracker source":string(model.bundledArtwork.selection(era),"caption","Artwork")}
+    var id:String="",workbook:String="",era:String="",size:CGFloat=64,color:Color=Color(hex:"DFB77F")
+    var image:NSImage? {model.covers[id] ?? model.bundledArtwork.image(id:id) ?? model.bundledArtwork.image(workbook:workbook,era:era)}
+    var caption:String {image == nil ? "Artwork assignment needed":id.hasPrefix("assigned-") ? "User-assigned artwork":model.covers[id] != nil && !id.hasPrefix("bundle-") ? "Recording artwork from its exact tracker source":string(model.bundledArtwork.selection(workbook,era),"caption","Worksheet-era artwork")}
     var body:some View {
         ZStack {
             RoundedRectangle(cornerRadius:10).fill(Color.black.opacity(0.65))
@@ -597,27 +603,27 @@ struct EraCard:View {
     var body:some View {
         Button{model.chooseEra(era.name)}label:{
             VStack(alignment:.leading,spacing:9){
-                Cover(model:model,id:era.artID,era:era.name,size:142,color:Color(hex:era.color))
+                Cover(model:model,id:era.artID,workbook:model.worksheet,era:era.name,size:142,color:Color(hex:era.color))
                 Text(era.name).font(.system(size:13,weight:.semibold)).lineLimit(2).multilineTextAlignment(.leading).frame(height:34,alignment:.topLeading)
-                Text("\(era.count.formatted()) rows  ·  Explore →").font(.system(size:10)).foregroundStyle(.secondary)
-            }.padding(12).frame(width:166,height:226).background(Color(hex:era.background).opacity(0.45),in:RoundedRectangle(cornerRadius:12))
-        }.buttonStyle(.plain).help(era.name+" — "+string(model.bundledArtwork.selection(era.name),"caption"))
+                Text("\(era.downloaded.formatted())/\(era.count.formatted()) downloaded").font(.system(size:10,weight:.semibold)).foregroundStyle(era.downloaded == era.count ? .green:.secondary)
+                Text("Explore →").font(.system(size:10)).foregroundStyle(.secondary)
+            }.padding(12).frame(width:166,height:242).background(Color(hex:era.background).opacity(0.45),in:RoundedRectangle(cornerRadius:12))
+        }.buttonStyle(.plain).help(era.name+" — "+string(model.bundledArtwork.selection(model.worksheet,era.name),"caption"))
     }
 }
 
 struct ArtworkAttribution:View {
     @ObservedObject var model:Library
-    let era:String
+    let workbook:String,era:String
     var body:some View {
-        let art=model.eras.first(where:{$0.name==era}).map{["caption":$0.artID.isEmpty ? "Artwork assignment needed":"Assigned artwork", "note":$0.artID.isEmpty ? "Choose a song, then assign an official Released cover or a unique worksheet-era cover in Source details.":"Artwork uses the exact row or worksheet-era assignment."]} ?? [:]
+        let art=model.bundledArtwork.selection(workbook,era)
         if !art.isEmpty {
-            DisclosureGroup("Era artwork") {
-                VStack(alignment:.leading,spacing:7){
-                    Text(string(art,"caption")).font(.caption.bold())
-                    Text(string(art,"note")).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                    Button("View artwork source"){model.openSource(string(art,"sourceUrl"))}.font(.caption)
-                }.frame(maxWidth:.infinity,alignment:.leading).padding(.top,6)
-            }.font(.caption)
+            VStack(alignment:.leading,spacing:7){
+                Eyebrow(text:"Artwork source")
+                Text(string(art,"caption")).font(.caption.bold())
+                Text(string(art,"note","Bundled display artwork is attributed to the captured worksheet and era.")).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                Button("View artwork source"){model.openSource(string(art,"sourceUrl"))}.font(.caption)
+            }.frame(maxWidth:.infinity,alignment:.leading).padding(10).background(Color.white.opacity(0.035),in:RoundedRectangle(cornerRadius:8))
         }
     }
 }
@@ -693,47 +699,40 @@ struct ContentView:View {
         }.buttonStyle(.borderless).padding(.horizontal,22).frame(height:60).background(model.section=="library" ? Color(hex:WorksheetPalette.colors[model.worksheet] ?? "27262A").opacity(0.24):.clear)
     }
     var library:some View {
-        VStack(spacing:0) {
-            if model.era.isEmpty && model.query.isEmpty {
-                eraShelf
-            }else if let e=model.eraInfo {
-                HStack(spacing:18){Cover(model:model,id:e.artID,era:e.name,size:76,color:Color(hex:e.color));VStack(alignment:.leading,spacing:6){Button{model.chooseEra("")}label:{Label("All eras",systemImage:"chevron.left").font(.caption)}.buttonStyle(.plain).foregroundStyle(.secondary);Text(e.name).font(.system(size:26,weight:.bold));Text(e.timeline.isEmpty ? "\(e.count.formatted()) source rows · original tracker order":e.timeline).font(.caption).foregroundStyle(.secondary).lineLimit(2)};Spacer();Button{Task{await model.downloadScope()}}label:{Label("Download All",systemImage:"arrow.down.circle.fill")}.help("Download every row in this era automatically, including placeholders for unavailable recordings. Per-file limits still apply.")}.padding(22).background(LinearGradient(colors:[Color(hex:e.background).opacity(0.6),Color.clear],startPoint:.leading,endPoint:.trailing))
-                ArtworkAttribution(model:model,era:e.name).padding(.horizontal,22).padding(.bottom,8)
-                if !e.description.isEmpty {
-                    VStack(alignment:.leading,spacing:6){Eyebrow(text:"Era notes");ScrollView{Text(e.description).font(.callout).foregroundStyle(.secondary).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading)}}.frame(maxHeight:100).padding(.horizontal,22).padding(.bottom,12)
+        ScrollView {
+            LazyVStack(spacing:0) {
+                if model.era.isEmpty && model.query.isEmpty {
+                    eraShelf
+                }else if let e=model.eraInfo {
+                    HStack(spacing:18){Cover(model:model,id:e.artID,workbook:model.worksheet,era:e.name,size:76,color:Color(hex:e.color));VStack(alignment:.leading,spacing:6){Button{model.chooseEra("")}label:{Label("All eras",systemImage:"chevron.left").font(.caption)}.buttonStyle(.plain).foregroundStyle(.secondary);Text(e.name).font(.system(size:26,weight:.bold));Text(e.timeline.isEmpty ? "\(e.downloaded.formatted())/\(e.count.formatted()) downloaded · original tracker order":e.timeline+" · \(e.downloaded.formatted())/\(e.count.formatted()) downloaded").font(.caption).foregroundStyle(.secondary).lineLimit(2)};Spacer();Button{Task{await model.downloadScope()}}label:{Label("Download All",systemImage:"arrow.down.circle.fill")}.help("Download every row in this worksheet and era automatically. Per-file limits still apply.")}.padding(22).background(LinearGradient(colors:[Color(hex:e.background).opacity(0.6),Color.clear],startPoint:.leading,endPoint:.trailing))
+                    ArtworkAttribution(model:model,workbook:model.worksheet,era:e.name).padding(.horizontal,22).padding(.bottom,8)
+                    if !e.description.isEmpty {
+                        VStack(alignment:.leading,spacing:6){Eyebrow(text:"Era notes");Text(e.description).font(.callout).foregroundStyle(.secondary).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading)}.padding(.horizontal,22).padding(.bottom,14)
+                    }
+                }
+                HStack(spacing:12){Text("\(model.total.formatted()) results").font(.system(size:12,weight:.semibold)).monospacedDigit();if model.busy{ProgressView().controlSize(.small)};Spacer();Picker("Media",selection:Binding(get:{model.kind},set:{model.chooseKind($0)})){Text("All assets").tag("");Text("Audio").tag("audio");Text("Video").tag("video");Text("Other").tag("other")}.labelsHidden().frame(width:110);Picker("Availability",selection:Binding(get:{model.filter},set:{model.chooseFilter($0)})){Text("All states").tag("all");Text("Local files").tag("local");Text("Missing / changed").tag("missing");Text("Ambiguous identity").tag("ambiguous");Text("Playable rows").tag("playable")}.labelsHidden().frame(width:150);if !model.selectedDownloadIDs.isEmpty{Button{Task{await model.download(model.selectedDownloadIDs)}}label:{Label("Save \(model.selectedDownloadIDs.count)",systemImage:"arrow.down.circle")}}}.padding(.horizontal,22).padding(.vertical,12)
+                if model.tracks.isEmpty && !model.busy {ContentUnavailableViewCompat(title:"No matching rows",detail:"Try a different era, search or availability filter.",symbol:"magnifyingglass").frame(minHeight:260)}
+                else {
+                    LazyVStack(spacing:3) {
+                        ForEach(model.tracks) {track in
+                            Button{model.selectRows([track.id])}label:{SongRow(model:model,track:track)}
+                                .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button("Play"){Task{await model.play(track.id)}}
+                                    Button("Inspect source"){model.selectRows([track.id]);model.setInspector(true)}
+                                    if sourceIndicator(sourceCount:track.sourceCount,availability:track.availability,ambiguous:track.ambiguous,eligible:track.eligible).canDownload {Button("Save this source"){Task{await model.download([track.id])}}}
+                                }
+                        }
+                    }.padding(.horizontal,12)
+                    if model.tracks.count<model.total {Button("Load next \(min(500,model.total-model.tracks.count)) rows · \(model.tracks.count.formatted()) loaded of \(model.total.formatted())"){Task{await model.reload(more:true)}}.buttonStyle(.borderless).padding(12)}
                 }
             }
-            HStack(spacing:12){Text("\(model.total.formatted()) results").font(.system(size:12,weight:.semibold)).monospacedDigit();if model.busy{ProgressView().controlSize(.small)};Spacer();Picker("Media",selection:Binding(get:{model.kind},set:{model.chooseKind($0)})){Text("All assets").tag("");Text("Audio").tag("audio");Text("Video").tag("video");Text("Other").tag("other")}.labelsHidden().frame(width:110);Picker("Availability",selection:Binding(get:{model.filter},set:{model.chooseFilter($0)})){Text("All states").tag("all");Text("Local files").tag("local");Text("Missing / changed").tag("missing");Text("Ambiguous identity").tag("ambiguous");Text("Playable rows").tag("playable")}.labelsHidden().frame(width:150);if !model.selectedDownloadIDs.isEmpty{Button{Task{await model.download(model.selectedDownloadIDs)}}label:{Label("Save \(model.selectedDownloadIDs.count)",systemImage:"arrow.down.circle")}}}.padding(.horizontal,22).padding(.vertical,12)
-            if model.tracks.isEmpty && !model.busy {ContentUnavailableViewCompat(title:"No matching rows",detail:"Try a different era, search or availability filter.",symbol:"magnifyingglass")}
-            else {
-                List(selection:Binding(get:{model.selection},set:{model.selectRows($0)})) {
-                    ForEach(model.tracks) {track in
-                        SongRow(model:model,track:track)
-                            .tag(track.id)
-                            .listRowBackground(Color(hex:model.eraBackground(track.era)))
-                            .listRowSeparator(.hidden)
-                    }
-                }.listStyle(.plain).scrollContentBackground(.hidden)
-                .contextMenu(forSelectionType:String.self){ids in
-                    if let id=ids.first {
-                        Button("Play"){Task{await model.play(id)}}
-                        Button("Inspect source"){model.selectRows([id]);model.setInspector(true)}
-                        let downloadable=model.downloadable(ids)
-                        if !downloadable.isEmpty {Button("Save selected"){Task{await model.download(downloadable)}}}
-                    }
-                } primaryAction:{ids in if let id=ids.first{Task{await model.play(id)}}}
-                if model.tracks.count<model.total {Button("Load next \(min(500,model.total-model.tracks.count)) rows · \(model.tracks.count.formatted()) loaded of \(model.total.formatted())"){Task{await model.reload(more:true)}}.buttonStyle(.borderless).padding(10)}
-            }
-        }
+        }.background(Color.black.opacity(0.04))
     }
     var eraShelf:some View {
         VStack(alignment:.leading,spacing:12){HStack{VStack(alignment:.leading,spacing:5){Eyebrow(text:"Browse the source");Text("Every era. Every version.").font(.system(size:25,weight:.bold))};Spacer();Text("\(model.eras.count) eras").font(.caption).foregroundStyle(.secondary)}
             ScrollView(.horizontal,showsIndicators:false){
-                LazyHStack(spacing:12){ForEach(model.eras){e in
-                    if model.inspector {
-                        Button{model.chooseEra(e.name)}label:{HStack(spacing:10){Cover(model:model,id:e.artID,era:e.name,size:42);VStack(alignment:.leading,spacing:4){Text(e.name).font(.caption.bold()).lineLimit(2);Text("\(e.count) rows").font(.system(size:10)).foregroundStyle(.secondary)}}.frame(width:190,alignment:.leading).padding(10).background(Color(hex:e.background).opacity(0.35),in:RoundedRectangle(cornerRadius:10))}.buttonStyle(.plain)
-                    } else {EraCard(model:model,era:e)}
-                }}
+                LazyHStack(spacing:12){ForEach(model.eras){e in EraCard(model:model,era:e)}}
             }
 
         }.padding(22)
@@ -748,18 +747,16 @@ struct ContentView:View {
                     if string(selected,"id") != model.now?.id {Button("Play selected"){Task{await model.play(string(selected,"id"))}}.controlSize(.small)}
                 } else {Text("Select a song to inspect its source").font(.caption).foregroundStyle(.secondary)}
                 Spacer()
-                Button{model.setInspector(!model.inspector)}label:{Label(model.inspector ? "Hide details":"Source details",systemImage:model.inspector ? "chevron.down":"chevron.up")}.controlSize(.small)
+                Label("Details shown automatically",systemImage:"doc.text.magnifyingglass").font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal,22).padding(.vertical,9)
-            if model.inspector {
-                Divider()
-                Inspector(model:model).id(string(model.detail["row"] as? Object ?? [:],"id")).frame(height:220)
-            }
+            Divider()
+            Inspector(model:model).id(string(model.detail["row"] as? Object ?? [:],"id")).frame(height:220)
             Divider()
             playerBar
         }.background(Color.black.opacity(0.2))
     }
     var playerBar:some View {
-        HStack(spacing:18){Button{Task{await model.revealPlaying()}}label:{HStack(spacing:12){Cover(model:model,id:model.nowArt,era:model.now?.era ?? "",size:52);VStack(alignment:.leading,spacing:4){Text(model.now?.title ?? "Nothing playing").font(.system(size:13,weight:.semibold)).lineLimit(1);Text(model.now?.era ?? "Choose a recording to begin").font(.caption).foregroundStyle(.secondary).lineLimit(1)}}.frame(width:250,alignment:.leading)}.buttonStyle(.plain).help("Reveal the playing source row")
+        HStack(spacing:18){Button{Task{await model.revealPlaying()}}label:{HStack(spacing:12){Cover(model:model,id:model.nowArt,workbook:model.now?.workbook ?? "",era:model.now?.era ?? "",size:52);VStack(alignment:.leading,spacing:4){Text(model.now?.title ?? "Nothing playing").font(.system(size:13,weight:.semibold)).lineLimit(1);Text(model.now?.era ?? "Choose a recording to begin").font(.caption).foregroundStyle(.secondary).lineLimit(1)}}.frame(width:250,alignment:.leading)}.buttonStyle(.plain).help("Reveal the playing source row")
             VStack(spacing:9){HStack(spacing:18){Button{model.shuffle.toggle()}label:{Image(systemName:"shuffle").foregroundStyle(model.shuffle ? Color(hex:"DBB782"):.secondary)}.help("Shuffle captured scope").accessibilityLabel("Shuffle captured scope");Button{Task{await model.advance(-1)}}label:{Image(systemName:"backward.end.fill")}.help("Previous recording").accessibilityLabel("Previous recording");Button{model.toggle()}label:{ZStack{Circle().fill(Color(hex:"E9CAA0")).frame(width:34,height:34);if model.loadingMedia{ProgressView().controlSize(.small)}else{Image(systemName:model.isPlaying ? "pause.fill":"play.fill").foregroundStyle(.black)}}}.accessibilityLabel(model.isPlaying ? "Pause":"Play");Button{Task{await model.advance(1)}}label:{Image(systemName:"forward.end.fill")}.help("Next recording").accessibilityLabel("Next recording");Button{model.repeatMode=model.repeatMode=="off" ? "all":model.repeatMode=="all" ? "one":"off"}label:{Image(systemName:model.repeatMode=="one" ? "repeat.1":"repeat").foregroundStyle(model.repeatMode=="off" ? .secondary:Color(hex:"DBB782"))}.help("Repeat: \(model.repeatMode)")}
                 HStack(spacing:9){Text(durationText(model.elapsed)).frame(width:40,alignment:.trailing);Slider(value:Binding(get:{min(model.elapsed,max(model.duration,1))},set:{model.seek($0)}),in:0...max(model.duration,1)).disabled(model.duration<=0).accessibilityLabel("Playback position");Text(durationText(model.duration)).frame(width:40,alignment:.leading)}.font(.system(size:10,design:.monospaced)).foregroundStyle(.secondary)
             }.frame(maxWidth:.infinity)
@@ -795,13 +792,27 @@ struct ContentUnavailableViewCompat:View {
     var body:some View{VStack(spacing:13){Image(systemName:symbol).font(.system(size:34,weight:.light)).foregroundStyle(.secondary);Text(title).font(.title3.bold());Text(detail).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)}.frame(maxWidth:.infinity,maxHeight:.infinity).padding(40)}
 }
 
+struct TrackTag:View {
+    let text:String,icon:String,label:String,color:Color,hasMedia:Bool
+    var body:some View {
+        let tagColor:Color=hasMedia ? color:.gray
+        let foreground:Color=hasMedia ? color:Color.white.opacity(0.55)
+        return HStack(spacing:4){Image(systemName:icon);Text(text).lineLimit(1)}
+            .font(.system(size:10,weight:.semibold)).foregroundColor(foreground)
+            .padding(.horizontal,8).padding(.vertical,4)
+            .background(Capsule().fill(tagColor.opacity(0.18)))
+            .help(label+": "+text).accessibilityLabel(label+": "+text)
+    }
+}
+
 struct SongRow:View {
     @ObservedObject var model:Library
     let track:Track
-    var fill:String {model.eraBackground(track.era)}
-    var ink:Color {eraUsesDarkText(fill) ? .black:.white}
+    var hasMedia:Bool {track.sourceCount > 0}
+    var fill:String {hasMedia ? model.eraBackground(track.era):"3B3B40"}
+    var ink:Color {hasMedia ? (eraUsesDarkText(fill) ? .black:.white):Color.white.opacity(0.62)}
     var source:SourceIndicator {sourceIndicator(sourceCount:track.sourceCount,availability:track.availability,ambiguous:track.ambiguous,eligible:track.eligible)}
-    func tag(_ text:String,icon:String,label:String)->some View {Label(text,systemImage:icon).font(.system(size:10,weight:.semibold)).lineLimit(1).padding(.horizontal,8).padding(.vertical,4).background(ink.opacity(0.10),in:Capsule()).help(label+": "+text).accessibilityLabel(label+": "+text)}
+    func tag(_ text:String,icon:String,label:String,color:Color)->TrackTag {TrackTag(text:text,icon:icon,label:label,color:color,hasMedia:hasMedia)}
     var body:some View {
         HStack(spacing:14) {
             Image(systemName:model.now?.id==track.id && model.isPlaying ? "waveform":track.kind=="video" ? "film":track.kind=="audio" ? "music.note":"doc").frame(width:22)
@@ -810,11 +821,13 @@ struct SongRow:View {
                 Text(track.era+" · source row "+String(track.sourceRow)).font(.system(size:10)).lineLimit(1)
             }.frame(maxWidth:.infinity,alignment:.leading)
             VStack(alignment:.leading,spacing:5) {
-                tag(track.availableLength.isEmpty ? "Not specified":track.availableLength,icon:"waveform",label:"Available length")
-                tag(track.quality.isEmpty ? "Not specified":track.quality,icon:"slider.horizontal.3",label:"Source quality")
+                tag(track.availableLength.isEmpty ? "Not specified":track.availableLength,icon:"waveform",label:"Available length",color:.cyan)
+                tag(track.quality.isEmpty ? "Not specified":track.quality,icon:"slider.horizontal.3",label:"Source quality",color:.purple)
             }.frame(width:158,alignment:.leading)
             Label(track.trackLength.isEmpty ? "—":track.trackLength,systemImage:"clock").font(.system(size:11,weight:.medium,design:.monospaced)).lineLimit(2).frame(width:84,alignment:.leading).help("Tracker duration: \(track.trackLength.isEmpty ? "unknown":track.trackLength)")
-            if let icon=source.icon {Image(systemName:icon).font(.system(size:16)).frame(width:24).help(source.label).accessibilityLabel(source.label)}
+            if let icon=source.icon {
+                Image(systemName:icon).font(.system(size:16)).frame(width:24).help(source.label).accessibilityLabel(source.label)
+            }
             Image(systemName:model.selection.contains(track.id) ? "checkmark.circle.fill":"circle").opacity(model.selection.contains(track.id) ? 1:0.35).frame(width:18)
         }.foregroundStyle(ink).padding(.horizontal,14).padding(.vertical,9)
         .frame(maxWidth:.infinity,alignment:.leading).background(Color(hex:fill))
@@ -847,13 +860,13 @@ struct Inspector:View {
         VStack(alignment:.leading,spacing:12) {
             Eyebrow(text:"Selected source")
             HStack(alignment:.top,spacing:12) {
-                Cover(model:model,id:artID,era:string(row,"era"),size:64)
+                Cover(model:model,id:artID,workbook:string(row,"workbook"),era:string(row,"era"),size:64)
                 VStack(alignment:.leading,spacing:5) {
                     Text(string(row,"title")).font(.headline).fixedSize(horizontal:false,vertical:true).textSelection(.enabled)
                     Text(string(row,"era")).font(.caption).foregroundStyle(.secondary)
                 }
             }
-            ArtworkAttribution(model:model,era:string(row,"era"))
+            ArtworkAttribution(model:model,workbook:string(row,"workbook"),era:string(row,"era"))
             HStack {
                 if !(row["links"] as? [String] ?? []).isEmpty,(row["eligible"] as? Bool) == true,(row["ambiguous"] as? Bool) != true {
                     Button("Save selected source"){Task{await model.download([string(row,"id")])}}
@@ -861,7 +874,7 @@ struct Inspector:View {
                 Button("Open tracker row"){model.openSource(string(row,"sourceUrl"))}
             }.controlSize(.small)
             Text(string(row,"name")).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            Text(string(model.detail["artwork"] as? Object ?? [:],"reason")).font(.caption).foregroundStyle(.orange)
+            if (model.detail["eraArtwork"] as? Object ?? [:]).isEmpty {Text(string(model.detail["artwork"] as? Object ?? [:],"reason")).font(.caption).foregroundStyle(.orange)}
             HStack{Button("Assign song art…"){model.assignArtwork(rowID:string(row,"id"),group:false)};Button("Assign era cover…"){model.assignArtwork(rowID:string(row,"id"),group:true)}}.controlSize(.small)
             if row["ambiguous"] as? Bool == true {Label("Ambiguous identity — inspect before saving.",systemImage:"exclamationmark.triangle").font(.caption).foregroundStyle(.orange)}
             if !file.isEmpty {

@@ -10,20 +10,20 @@ from pathlib import Path
 
 
 class ArtworkCatalog:
-    def __init__(self, directory, eras=None):
+    def __init__(self, directory, groups=None):
         self.directory = Path(directory)
         self.assets = {}
-        self.eras = {}
+        self.groups = {}
         manifest = self.directory / 'manifest.json'
         if not manifest.exists():
-            if eras is not None:
+            if groups is not None:
                 raise ValueError('Bundled era artwork is missing. Reinstall the complete app.')
             return
         data = json.loads(manifest.read_text())
-        if data.get('schema') != 1:
+        if data.get('schema') != 2:
             raise ValueError('Unsupported artwork manifest.')
         self.assets = data['assets']
-        self.eras = data['eras']
+        self.groups = data['groups']
         for key, asset in self.assets.items():
             if not re.fullmatch(r'bundle-[a-f0-9]{24}', key):
                 raise ValueError('Invalid bundled artwork identity.')
@@ -36,16 +36,28 @@ class ArtworkCatalog:
             payload = path.read_bytes()
             if len(payload) != asset['bytes'] or hashlib.sha256(payload).hexdigest() != asset['sha256']:
                 raise ValueError('Bundled artwork checksum mismatch.')
-        for era, selection in self.eras.items():
-            if not era or selection['assetId'] not in self.assets or not selection['sourceUrl'] or not selection['caption']:
+        assigned=[]
+        for group, selection in self.groups.items():
+            try:identity=json.loads(group)
+            except (TypeError,ValueError):raise ValueError('Invalid worksheet-era artwork identity.')
+            if not isinstance(identity,list) or len(identity)!=2 or not all(isinstance(x,str) and x for x in identity):
+                raise ValueError('Invalid worksheet-era artwork identity.')
+            if selection['assetId'] not in self.assets or not selection['sourceUrl'] or not selection['caption']:
                 raise ValueError('Incomplete era artwork attribution.')
             if selection.get('exportEligible') is not False:
                 raise ValueError('Display artwork cannot authorize audio tags.')
-        if eras is not None and set(eras) != set(self.eras):
-            raise ValueError('The catalog and bundled era artwork do not have identical coverage.')
+            assigned.append(selection['assetId'])
+        if len(assigned)!=len(set(assigned)) or len({self.assets[x]['sha256'] for x in assigned})!=len(assigned):
+            raise ValueError('Every worksheet-era group must use a unique artwork image.')
+        if groups is not None:
+            actual={tuple(json.loads(key)) for key in self.groups}
+            if set(groups)!=actual:raise ValueError('The catalog and bundled worksheet-era artwork do not have identical coverage.')
 
-    def for_era(self, era):
-        selection = self.eras.get(era)
+    @staticmethod
+    def key(workbook,era):return json.dumps([str(workbook),str(era)],ensure_ascii=False,separators=(',',':'))
+
+    def for_group(self, workbook, era):
+        selection = self.groups.get(self.key(workbook,era))
         if selection is None:
             return None
         return dict(selection, rowId=selection['assetId'], bundled=True, exportEligible=False)
