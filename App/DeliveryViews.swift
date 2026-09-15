@@ -45,6 +45,7 @@ struct EraRunProgress:View {
     var done:Int{["completed","skipped","placeholder","failed","metadata_failed","cancelled","interrupted"].reduce(0){$0+number(counts,$1)}}
     var body:some View {
         VStack(alignment:.leading,spacing:8){
+            Text(string(batch,"label","Selected source rows")).font(.title3.bold())
             Text("\(done) of \(number(batch,"total")) rows resolved or stopped").font(.headline)
             ProgressView(value:Double(done),total:Double(max(number(batch,"total"),1)))
             Text("\(number(counts,"completed")) saved · \(number(counts,"skipped")) already saved · \(number(counts,"placeholder")) placeholders · \(number(counts,"failed")+number(counts,"metadata_failed")) failed · \(number(counts,"awaiting_access")) need access · \(number(counts,"cancelled")+number(counts,"interrupted")) stopped").font(.caption)

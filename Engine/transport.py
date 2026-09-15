@@ -6,6 +6,19 @@ from urllib.parse import urlsplit, urljoin
 import mutagen
 import mutagen.mp4, mutagen.flac, mutagen._vorbis
 
+def source_priority(url):
+    """Prefer attached sources that expose a direct public file without a login."""
+    parsed=urlsplit(url);host=(parsed.hostname or '').lower();path=parsed.path.lower()
+    if host in ('pillows.su','www.pillows.su','api.pillows.su'):return 0
+    if path.endswith(('.mp3','.m4a','.aac','.flac','.wav','.aiff','.ogg','.mp4','.webm')):return 1
+    if host in ('soundcloud.com','www.soundcloud.com','drive.google.com','www.dropbox.com'):return 3
+    return 2
+
+def ordered_sources(links):
+    """Return unique row-attached URLs in stable easiest-first order."""
+    unique=list(dict.fromkeys(str(url) for url in links if url))
+    return [url for _,url in sorted(enumerate(unique),key=lambda item:(source_priority(item[1]),item[0]))]
+
 class MediaError(ValueError):
     code='access_unavailable'
 

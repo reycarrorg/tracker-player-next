@@ -6,6 +6,8 @@ This repository is public source-available software. It is licensed under PolyFo
 
 The repository intentionally contains no captured workbook, real song rows, media, album or era artwork, provider credentials, browser cookies, signed URLs, Drive identifiers, user-library state, QA cache, or compiled application. See [DATA_BOUNDARIES.md](DATA_BOUNDARIES.md) and [DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md).
 
+Version 1.5.0 adds stable easiest-source-first fallback for rows with multiple attached links, worksheet and era labels on transfer batches, per-era downloaded counts, exact worksheet-era artwork identities, a single scrolling source browser, always-visible source details, colored metadata tags, and a neutral treatment for rows without media. Source fallback stays within the URLs attached to the row and does not import browser cookies or credentials. Private builds may inject an attributed schema-2 artwork manifest with one distinct asset for every exact worksheet and era pair; this public repository does not include those third-party images.
+
 ## Build and test
 
 Requirements: macOS 14 or later, Xcode command-line tools, Python 3.9 or later, and Mutagen 1.47.0 installed in an isolated environment.

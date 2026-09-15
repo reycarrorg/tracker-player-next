@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 import transport
 from artwork import ArtworkCatalog
-from delivery import DeliveryMixin
+from delivery import DeliveryMixin, classification
 from delivery_metadata import destination, public_record, base_name
 
 MIB = 1048576
@@ -69,7 +69,7 @@ class SnapshotCatalog:
         expected=hashlib.sha256(json.dumps([(r['id'],r['sourceHash']) for r in rows],ensure_ascii=False,sort_keys=True).encode()).hexdigest()
         if c.get('snapshotHash') != expected: raise Problem('revision_mismatch', 'Snapshot checksum does not match its source rows.')
         artwork_dir = Path(path).with_name('Artwork')
-        self.bundled_art = ArtworkCatalog(artwork_dir, {r['era'] for r in rows} if artwork_dir.exists() else None)
+        self.bundled_art = ArtworkCatalog(artwork_dir, {(r['workbook'],r['era']) for r in rows} if artwork_dir.exists() else None)
         self.art_candidates={}
         for r in rows:
             if r['workbook']=='Art' and r['fields'].get('Project Type')=='Front Cover' and r['fields'].get('Use')=='Used':
@@ -282,7 +282,7 @@ class Engine(DeliveryMixin):
             f=self.db.execute('SELECT * FROM files WHERE id=?',(r['id'],)).fetchone()
             attempts=[dict(x) for x in self.db.execute('SELECT state,error,code,updated FROM jobs WHERE row_id=? ORDER BY created DESC LIMIT 5',(r['id'],))]
             exports=[dict(x) for x in self.db.execute('SELECT * FROM exports WHERE row_id=? ORDER BY created DESC',(r['id'],))]
-        era_art = self.delivery_art(dict(r,id='__group__'))
+        era_art = self.adapter.bundled_art.for_group(r['workbook'],r['era']) or self.delivery_art(dict(r,id='__group__'))
         return {'row':r,'file':dict(f) if f else None,'artwork':self.delivery_art(r),'eraArtwork':era_art,'artistForExport':self.adapter.explicit_artist(r),'attempts':attempts,'exports':exports}
     def boot(self,p):
         with self.lock:
@@ -290,12 +290,13 @@ class Engine(DeliveryMixin):
         return {'workbooks':workbooks,'count':len(self.catalog['rows']),'revision':self.catalog['snapshotHash'],'captured':self.catalog['captured'],'session':self.pref('session',{}),'root':str(self.root),'integrity':self.integrity,'limits':self.limits()}
     def eras(self,p):
         with self.lock:
-            groups=self.db.execute('SELECT era,count(*) n FROM rows WHERE workbook=? GROUP BY era ORDER BY min(ordinal)',(p['workbook'],)).fetchall()
+            groups=self.db.execute("SELECT r.era,count(*) n,sum(CASE WHEN f.state='available' THEN 1 ELSE 0 END) downloaded FROM rows r LEFT JOIN files f ON r.id=f.id WHERE r.workbook=? GROUP BY r.era ORDER BY min(r.ordinal)",(p['workbook'],)).fetchall()
         result=[]
         for group in groups:
             era=group['era'];meta=self.catalog.get('eras',{}).get(p['workbook']+'|'+era,{})
             sample=next(r for r in self.catalog['rows'] if r['workbook']==p['workbook'] and r['era']==era)
-            result.append({'name':era,'count':group['n'],'metadata':meta,'artwork':self.delivery_art(dict(sample,id='__group__'))})
+            display_art=self.adapter.bundled_art.for_group(p['workbook'],era) or self.delivery_art(dict(sample,id='__group__'))
+            result.append({'name':era,'count':group['n'],'downloaded':group['downloaded'] or 0,'metadata':meta,'artwork':display_art})
         return result
     def limits(self): return self.pref('limits',{'count':25,'fileMB':128,'batchMB':512,'cacheMB':256,'previewMB':64})
     def settings(self,p):
@@ -327,46 +328,50 @@ class Engine(DeliveryMixin):
         local=self.local(r['id'])
         if local and not source and not force:
             return {'path':local['path'],'kind':local['kind'],'mode':local['mode'],'notice':'SHA-256 verified','id':r['id']}
-        links=[source] if source else r['links']
+        links=[source] if source else transport.ordered_sources(r['links'])
         if not links: raise Problem('no_source','This row has no media link. Its tracker fields remain available.')
-        url=links[0] # explicit source selection; never silently switch alternate identities
         approved=0
         if p.get('sizeToken'):
             with self.lock:request=self.size_requests.pop(p['sizeToken'],None)
-            if not request or request['rowId']!=r['id'] or request['source']!=url or request['expires']<time.monotonic():
+            if not request or request['rowId']!=r['id'] or request['source'] not in links or request['expires']<time.monotonic():
                 raise Problem('stale_approval','This file approval expired or belongs to another source. Try Play again.')
-            approved=request['requestedBytes'];self.disk_guard(approved)
-        key=hashlib.sha256((r['id']+'|'+url).encode()).hexdigest()[:32]
+            links=[request['source']];approved=request['requestedBytes'];self.disk_guard(approved)
+        errors=[]
         with self.cache_lock:
             if self.closing:raise Problem('closing','Player is shutting down.')
-            meta=contained(self.root/'Cache',key+'.json')
-            if meta.exists():
+            for url in links:
+                key=hashlib.sha256((r['id']+'|'+url).encode()).hexdigest()[:32]
+                meta=contained(self.root/'Cache',key+'.json')
+                if meta.exists():
+                    try:
+                        saved=json.loads(meta.read_text());target=contained(self.root/'Cache',saved['filename'])
+                        if target.stem==key and target.is_file() and target.stat().st_size==saved['bytes'] and digest(target)==saved['checksum']:
+                            self.pin(target,saved['kind']);return saved|{'path':str(target),'mode':'temporary','notice':'Verified temporary cache; original media endpoint','id':r['id']}
+                    except (ValueError,KeyError,OSError):pass
+                cfg=self.limits();file_limit=approved or cfg['previewMB']*MIB
+                cache_cap=cfg['cacheMB']*MIB+approved
+                self.trim_cache(min(cache_cap,file_limit+4096),cap=cache_cap)
+                part=contained(self.root/'Cache',key+'.'+uuid.uuid4().hex+'.part')
                 try:
-                    saved=json.loads(meta.read_text());target=contained(self.root/'Cache',saved['filename'])
-                    if target.stem==key and target.is_file() and target.stat().st_size==saved['bytes'] and digest(target)==saved['checksum']:
-                        self.pin(target,saved['kind']);return saved|{'path':str(target),'mode':'temporary','notice':'Verified temporary cache; original media endpoint','id':r['id']}
-                except (ValueError,KeyError,OSError):pass
-            cfg=self.limits();file_limit=approved or cfg['previewMB']*MIB
-            cache_cap=cfg['cacheMB']*MIB+approved
-            self.trim_cache(min(cache_cap,file_limit+4096),cap=cache_cap)
-            part=contained(self.root/'Cache',key+'.'+uuid.uuid4().hex+'.part')
-            try:
-                info=transport.download(url,part,file_limit,consume=self.disk_guard,cancel=lambda:self.closing,original_media=True)
-                if self.closing:raise Problem('closing','Player is shutting down.')
-                self.trim_cache(4096,cap=cache_cap)
-                target=contained(self.root/'Cache',key+'.'+info['extension'])
-                if str(target) in self.pins:raise Problem('cache_pinned','Stop playback before replacing this cached recording.')
-                os.replace(part,target)
-                saved=info|{'filename':target.name};atomic_json(meta,saved);self.pin(target,info['kind'])
-                with self.transaction():self.event('preview',r['id'],info)
-                return saved|{'path':str(target),'mode':'temporary','notice':'Bounded temporary copy; not a permanent download','id':r['id']}
-            except transport.FileLimit as e:
-                return {'approval':self.size_request(r,url,e)}
-            except Exception as e:
-                with self.transaction():self.event('source_failure',r['id'],public_record({'source':url,'message':str(e)}))
-                raise
-            finally:
-                if part.exists():part.unlink()
+                    info=transport.download(url,part,file_limit,consume=self.disk_guard,cancel=lambda:self.closing,original_media=True)
+                    if self.closing:raise Problem('closing','Player is shutting down.')
+                    self.trim_cache(4096,cap=cache_cap)
+                    target=contained(self.root/'Cache',key+'.'+info['extension'])
+                    if str(target) in self.pins:raise Problem('cache_pinned','Stop playback before replacing this cached recording.')
+                    os.replace(part,target)
+                    saved=info|{'filename':target.name,'sourceAttempts':errors};atomic_json(meta,saved);self.pin(target,info['kind'])
+                    with self.transaction():self.event('preview',r['id'],saved)
+                    return saved|{'path':str(target),'mode':'temporary','notice':'Bounded temporary copy; easiest attached source tried first','id':r['id']}
+                except transport.FileLimit as e:
+                    return {'approval':self.size_request(r,url,e)}
+                except Exception as e:
+                    failure={'source':url,'classification':classification(e),'message':str(e)};errors.append(failure)
+                    with self.transaction():self.event('source_failure',r['id'],public_record(failure))
+                    if source is not None or classification(e)=='cancelled':raise
+                finally:
+                    if part.exists():part.unlink()
+        last=errors[-1] if errors else {'classification':'access_unavailable','message':'No attached source succeeded.'}
+        raise transport.AccessError(last['classification'],last['message'])
     def disk_guard(self,n):
         if shutil.disk_usage(self.root).free < 256*MIB+n: raise Problem('disk_reserve','256 MB free-space reserve reached.')
     def size_request(self,row,url,error):
@@ -457,7 +462,10 @@ class Engine(DeliveryMixin):
         with self.transaction():
             if self.closing:raise Problem('closing','Player is shutting down.')
             if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('queued','running','cancelling','awaiting_approval')").fetchone():raise Problem('batch_active','Finish or cancel the active batch first.')
-            self.setpref('batch:'+batch,{'received':0,'limit':(2**60 if p.get('allEra') else cfg['batchMB']*MIB),'fileLimit':cfg['fileMB']*MIB,'allEra':bool(p.get('allEra')),'total':len(rows)})
+            workbook=p.get('workbook') or (rows[0]['workbook'] if rows and len({r['workbook'] for r in rows})==1 else '')
+            era=p.get('era') or (rows[0]['era'] if rows and len({(r['workbook'],r['era']) for r in rows})==1 else '')
+            label=(workbook+' / '+era) if workbook and era else ('Selected rows in '+workbook if workbook else 'Selected source rows')
+            self.setpref('batch:'+batch,{'received':0,'limit':(2**60 if p.get('allEra') else cfg['batchMB']*MIB),'fileLimit':cfg['fileMB']*MIB,'allEra':bool(p.get('allEra')),'total':len(rows),'workbook':workbook,'era':era,'label':label})
             for r in rows:
                 jid=uuid.uuid4().hex;jobs.append(jid)
                 self.db.execute('INSERT INTO jobs(id,row_id,batch,state,created,updated) VALUES(?,?,?,?,?,?)',(jid,r['id'],batch,'queued',stamp(),stamp()))
@@ -509,7 +517,19 @@ class Engine(DeliveryMixin):
                 info=json.loads(existing['record']);info.pop('metadataFailure',None)
                 info.update(bytes=existing['bytes'],checksum=existing['checksum'])
             else:
-                info,asset_lock=self.request_asset(row,part,file_limit,consume=consume,cancel=lambda:jid in self.cancelled or self.closing,progress=progress,reserve=reserve,release=release)
+                attempts=[];last_error=None
+                for source in transport.ordered_sources(row['links']):
+                    try:
+                        info,asset_lock=self.request_asset(row,part,file_limit,source=source,consume=consume,cancel=lambda:jid in self.cancelled or self.closing,progress=progress,reserve=reserve,release=release)
+                        info['sourceAttempts']=attempts;break
+                    except transport.FileLimit:raise
+                    except Exception as error:
+                        last_error=error;attempts.append({'source':source,'classification':classification(error),'message':str(error)})
+                        if part.exists():part.unlink()
+                        if classification(error)=='cancelled':raise
+                else:
+                    self.recovery_failure(row,job,last_error or transport.AccessError('access_unavailable','No attached source succeeded.'),source=attempts[-1]['source'] if attempts else '',attempts=attempts)
+                    return
             if part.stat().st_size!=info['bytes'] or digest(part)!=info['checksum']:raise Problem('download_checksum','Transfer checksum mismatch.')
             info=self.tag_download(part,row,info)
             folder=Path('Suzy Tracker')/safe_name(row['workbook'])/safe_name(row['era'])
@@ -573,7 +593,8 @@ class Engine(DeliveryMixin):
             batches=[]
             for b in self.db.execute('SELECT batch,max(created) recent,count(*) total FROM jobs GROUP BY batch ORDER BY recent DESC LIMIT 10').fetchall():
                 counts=dict(self.db.execute('SELECT state,count(*) FROM jobs WHERE batch=? GROUP BY state',(b['batch'],)).fetchall())
-                batches.append(dict(id=b['batch'],batch=b['batch'],total=b['total'],counts=counts))
+                cfg=self.pref('batch:'+b['batch'],{})
+                batches.append(dict(id=b['batch'],batch=b['batch'],total=b['total'],counts=counts,workbook=cfg.get('workbook',''),era=cfg.get('era',''),label=cfg.get('label','Selected source rows')))
         return {'jobs':jobs,'exports':exports,'limits':self.limits(),'batches':batches}
     def stats(self,p):
         where,args=self.where(p)
