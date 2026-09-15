@@ -560,7 +560,10 @@ func decodedArtwork(_ path:String) -> NSImage? {
     func attachDownload(_ job:Object) {
         let panel=NSOpenPanel();panel.canChooseDirectories=false;panel.allowsMultipleSelection=false
         panel.message="Choose the file you downloaded for \(string(job,"title")). You confirm its identity; this app cannot verify your browser session. The selected original is preserved."
-        guard panel.runModal() == .OK,let url=panel.url else{return}
+        guard panel.runModal() == .OK,let url=panel.url else{return};importDownloadedFile(job,file:url)
+    }
+    func attachBrowserDownload(_ job:Object,file:URL) {importDownloadedFile(job,file:file)}
+    private func importDownloadedFile(_ job:Object,file url:URL) {
         Task {
             let size=(try? url.resourceValues(forKeys:[.fileSizeKey]).fileSize) ?? 0
             var allowLarge=false
@@ -569,6 +572,16 @@ func decodedArtwork(_ path:String) -> NSImage? {
                 if !allowLarge{return}
             }
             await perform("attach_download",["id":string(job,"id"),"path":url.path,"allowLarge":allowLarge]);showRecovery=false
+        }
+    }
+    func saveCopy(_ job:Object) {
+        Task {
+            do {
+                let info=try await object("copy_info",["id":string(job,"id")])
+                let panel=NSSavePanel();panel.title="Save a verified copy";panel.message="Choose a new destination. Tracker Player verifies the copied checksum and never overwrites an existing file.";panel.nameFieldStringValue=string(info,"suggestedName","Tracker download")
+                guard panel.runModal() == .OK,let url=panel.url else{return}
+                await perform("save_copy",["id":string(job,"id"),"path":url.path])
+            } catch {failure=error.localizedDescription}
         }
     }
     func assignArtwork(rowID:String,group:Bool) {

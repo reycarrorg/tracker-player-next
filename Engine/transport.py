@@ -1,5 +1,5 @@
 """Public HTTP media transport; DNS is checked and pinned for each redirect."""
-import hashlib, http.client, ipaddress, json, os, re, socket, ssl, time
+import hashlib, http.client, ipaddress, json, os, re, socket, ssl, stat, time
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit, urljoin
@@ -56,18 +56,21 @@ def public_target(url):
 class PinnedHTTPS(http.client.HTTPSConnection):
     def __init__(self,host,ip,port): super().__init__(host,port,timeout=15,context=ssl.create_default_context()); self.ip=ip
     def connect(self): self.sock=self._context.wrap_socket(socket.create_connection((self.ip,self.port),self.timeout),server_hostname=self.host)
-def response(url):
+def response(url,headers=None):
+    headers=dict(headers or {})
     for _ in range(6):
         p,ip=public_target(url)
         conn=PinnedHTTPS(p.hostname,ip,p.port or 443)
         try:
-            conn.request('GET',(p.path or '/')+('?' +p.query if p.query else ''),headers={'User-Agent':'TrackerPlayer/1.0','Accept-Encoding':'identity','Connection':'close'})
+            request_headers={'User-Agent':'TrackerPlayer/1.6','Accept-Encoding':'identity','Connection':'close'}
+            request_headers.update(headers)
+            conn.request('GET',(p.path or '/')+('?' +p.query if p.query else ''),headers=request_headers)
             r=conn.getresponse()
             if r.status in (301,302,303,307,308):
                 location=r.getheader('Location'); conn.close()
                 if not location: raise MediaError('Redirect without destination.')
                 url=urljoin(url,location); continue
-            if r.status!=200: raise AccessError(classify_http(r.status,bool(r.getheader('WWW-Authenticate'))),f'Source returned HTTP {r.status}. Open the provider to review access; no browser session was imported.')
+            if r.status not in (200,206): raise AccessError(classify_http(r.status,bool(r.getheader('WWW-Authenticate'))),f'Source returned HTTP {r.status}. Open the provider to review access; no browser session was imported.')
             return conn,r,url
         except Exception: conn.close(); raise
     raise MediaError('Too many redirects.')
@@ -101,16 +104,37 @@ def sniff(b,header=''):
     if header.startswith('text/plain') and b'\x00' not in b: return 'text','txt','text/plain'
     raise MediaError('Unsupported or unrecognized content; use Open source. No extension-based assumptions.')
 
-def download(url,path,limit,consume=lambda n:None,cancel=lambda:False,progress=lambda n,total:None,art=False,original_media=True,reserve=None,release=None):
-    original=url; deadline=time.monotonic()+max(180,min(7200,limit/262144+60) if limit>128*1048576 else 180); received=0
-    def read_chunk(response,wanted):
+def _resume_total(header,offset,content_length):
+    match=re.fullmatch(r'bytes\s+(\d+)-(\d+)/(\d+|\*)',header or '',re.I)
+    if not match or int(match.group(1))!=offset:return None
+    total=None if match.group(3)=='*' else int(match.group(3))
+    if total is not None and total<offset:return None
+    if content_length and int(match.group(2))-offset+1!=content_length:return None
+    return total
+
+def _writer(path,append):
+    flags=os.O_WRONLY|os.O_NOFOLLOW|(os.O_APPEND if append else os.O_CREAT|os.O_EXCL)
+    fd=os.open(path,flags,0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd);raise MediaError('Download destination must be a regular file.')
+    return os.fdopen(fd,'ab' if append else 'wb')
+
+def download(url,path,limit,consume=lambda n:None,cancel=lambda:False,progress=lambda n,total:None,art=False,original_media=True,reserve=None,release=None,open_response=None,max_attempts=3):
+    """Download and validate media, retrying interrupted direct transfers with Range.
+
+    ``open_response`` is an injection point for deterministic fixtures. Production
+    callers use the DNS-pinned HTTPS opener above.
+    """
+    original=url;path=Path(path);deadline=time.monotonic()+max(180,min(7200,limit/262144+60) if limit>128*1048576 else 180);received=0
+    opener=open_response or response
+    def read_chunk(http_response,wanted,current):
         nonlocal received
-        allowance=min(wanted,limit-received)
+        allowance=min(wanted,limit-current)
         if allowance<=0: raise FileLimit(limit)
         if reserve: allowance=reserve(allowance)
         if allowance<=0: raise MediaError('Batch actual-byte cap reached.')
         try:
-            data=response.read(allowance); received+=len(data); consume(len(data)); return data
+            data=http_response.read(allowance); received+=len(data); consume(len(data)); return data
         finally:
             if release: release(allowance)
     p=urlsplit(url)
@@ -118,43 +142,69 @@ def download(url,path,limit,consume=lambda n:None,cancel=lambda:False,progress=l
         # Same public media endpoint used by the host player, verified 2026-09-05.
         url='https://api.pillows.su/api/'+('download/' if original_media else 'get/')+p.path.rsplit('/',1)[1]
     for depth in range(3):
-        conn,r,final=response(url)
-        try:
-            total=int(r.getheader('Content-Length') or 0); header=r.getheader('Content-Type','').split(';')[0].lower()
-            if total>limit and header!='text/html': raise FileLimit(limit,total)
-            first=read_chunk(r,8192)
-            if header=='text/html' or first.lstrip().lower().startswith((b'<!doctype html',b'<html')):
-                host=urlsplit(final).hostname
-                if host not in ('pillows.su','www.pillows.su','ibb.co','www.ibb.co'): raise AccessError(classify_page(first),'Provider page requires browser interaction or does not expose supported public media. Open the provider; browser sign-in is not shared with this downloader.')
-                extra=read_chunk(r,256000); page=PageMedia(); page.feed((first+extra).decode('utf-8',errors='replace'))
-                candidates=page.images if art else page.media
-                if not candidates: raise MediaError('No supported public media URL in the source page. Use Open source.')
-                url=urljoin(final,candidates[0]); continue
-            kind,ext,mime=sniff(first,header)
-            if art and kind!='image': raise MediaError('Cover source did not return an image.')
-            size=len(first)
-            if size>limit: raise MediaError('Per-file byte cap reached.')
-            with open(path,'xb') as f:
-                f.write(first)
-                while True:
-                    if cancel(): raise MediaError('Cancelled')
-                    if time.monotonic()>deadline: raise MediaError('Transfer time limit reached; retry explicitly.')
-                    if total and size>=total: break
-                    chunk=read_chunk(r,65536)
-                    if not chunk: break
-                    size+=len(chunk)
-                    if size>limit: raise MediaError('Per-file byte cap reached.')
-                    f.write(chunk); progress(size,total or None)
-                f.flush(); os.fsync(f.fileno())
-            if total and size!=total: raise MediaError('Incomplete transfer; file was not completed.')
-            if kind=='audio':
-                try:
-                    audio=mutagen.File(path)
-                    if audio is None or not audio.info.length>0: raise MediaError('Audio decoding metadata validation failed.')
-                    if isinstance(audio,mutagen.mp4.MP4): ext='m4a'; mime='audio/mp4'
-                except Exception as e: raise MediaError('Audio payload could not be validated: '+str(e))
-            return dict(originalUrl=original,resolvedUrl=final,bytes=size,kind=kind,extension=ext,mime=mime,checksum=hashlib.sha256(Path(path).read_bytes()).hexdigest(),declaredBytes=total or None)
-        finally: conn.close()
+        page_resolved=False
+        last_network_error=None
+        for attempt in range(max(1,max_attempts)):
+            if cancel():raise AccessError('cancelled','Cancelled.')
+            if time.monotonic()>deadline:raise AccessError('network_failure','Transfer time limit reached; retry explicitly.')
+            if path.exists() and (path.is_symlink() or not path.is_file()):raise MediaError('Download destination must be a regular file.')
+            offset=path.stat().st_size if path.exists() else 0
+            if offset>limit:raise FileLimit(limit,offset)
+            headers={'Range':f'bytes={offset}-'} if offset else {}
+            conn=None
+            try:
+                conn,r,final=opener(url,headers)
+                status=getattr(r,'status',200)
+                content_length=int(r.getheader('Content-Length') or 0)
+                header=r.getheader('Content-Type','').split(';')[0].lower()
+                if not offset and content_length>limit and header!='text/html':raise FileLimit(limit,content_length)
+                if offset:
+                    resume_total=_resume_total(r.getheader('Content-Range'),offset,content_length) if status==206 else None
+                    if resume_total is None:
+                        conn.close();conn=None;path.unlink();continue
+                    total=resume_total or (offset+content_length if content_length else 0)
+                    with open(path,'rb') as existing:first=existing.read(8192)
+                else:
+                    total=content_length
+                    first=read_chunk(r,8192,0)
+                if total>limit and header!='text/html':raise FileLimit(limit,total)
+                if not offset and (header=='text/html' or first.lstrip().lower().startswith((b'<!doctype html',b'<html'))):
+                    host=urlsplit(final).hostname
+                    if host not in ('pillows.su','www.pillows.su','ibb.co','www.ibb.co'):raise AccessError(classify_page(first),'Provider page requires browser interaction or does not expose supported public media. Open it in the in-app browser; no browser session enters this downloader.')
+                    extra=read_chunk(r,256000,len(first));page=PageMedia();page.feed((first+extra).decode('utf-8',errors='replace'))
+                    candidates=page.images if art else page.media
+                    if not candidates:raise MediaError('No supported public media URL in the source page. Use Open source.')
+                    url=urljoin(final,candidates[0]);page_resolved=True;break
+                kind,ext,mime=sniff(first,header)
+                if art and kind!='image':raise MediaError('Cover source did not return an image.')
+                size=offset
+                with _writer(path,append=bool(offset)) as f:
+                    if not offset:
+                        f.write(first);size=len(first);progress(size,total or None)
+                    while True:
+                        if cancel():raise AccessError('cancelled','Cancelled.')
+                        if time.monotonic()>deadline:raise AccessError('network_failure','Transfer time limit reached; retry explicitly.')
+                        if total and size>=total:break
+                        chunk=read_chunk(r,65536,size)
+                        if not chunk:break
+                        size+=len(chunk);f.write(chunk);progress(size,total or None)
+                    f.flush();os.fsync(f.fileno())
+                if total and size!=total:raise ConnectionError(f'Incomplete transfer: received {size} of {total} bytes.')
+                if kind=='audio':
+                    try:
+                        audio=mutagen.File(path)
+                        if audio is None or not audio.info.length>0:raise MediaError('Audio decoding metadata validation failed.')
+                        if isinstance(audio,mutagen.mp4.MP4):ext='m4a';mime='audio/mp4'
+                    except MediaError:raise
+                    except Exception as e:raise MediaError('Audio payload could not be validated: '+str(e))
+                return dict(originalUrl=original,resolvedUrl=final,bytes=size,kind=kind,extension=ext,mime=mime,checksum=hashlib.sha256(path.read_bytes()).hexdigest(),declaredBytes=total or None,resumed=offset>0,attempts=attempt+1)
+            except (ConnectionError,TimeoutError,socket.timeout,http.client.IncompleteRead,http.client.RemoteDisconnected) as error:
+                last_network_error=error
+                if attempt+1>=max(1,max_attempts):raise AccessError('network_failure','Transfer was interrupted after bounded retries.') from error
+            finally:
+                if conn is not None:conn.close()
+        if page_resolved:continue
+        if last_network_error:raise AccessError('network_failure','Transfer was interrupted after bounded retries.') from last_network_error
     raise MediaError('Source page resolution limit reached.')
 
 def tag_copy(path,row,artwork=None):

@@ -2,17 +2,29 @@ import SwiftUI
 
 struct RecoveryView:View {
     @ObservedObject var model:Library
+    @State private var browserVisible=false
+    var browserURL:URL? {URL(string:string(model.recoveryInfo,"url"))}
     var body:some View {
         VStack(alignment:.leading,spacing:18){
-            Text("Resolve source access").font(.title2.bold())
-            Text(string(model.recoveryJob,"title")).font(.headline)
-            Text(string(model.recoveryInfo,"message")).fixedSize(horizontal:false,vertical:true)
-            Text("No passwords, cookies, or browser-session data are collected. A public retry does not imply that browser sign-in succeeded.").font(.caption).foregroundStyle(.secondary)
-            HStack{Button("Open provider / Sign in"){model.openSource(string(model.recoveryInfo,"url"))};Button("Retry same public source"){Task{await model.perform("retry",["id":string(model.recoveryJob,"id")]);model.showRecovery=false}}}
-            Button("Attach downloaded file…"){model.attachDownload(model.recoveryJob)}
+            HStack{Button(browserVisible ? "Back to choices":"Back · keep unresolved"){if browserVisible{browserVisible=false}else{model.showRecovery=false}};Spacer();Text("Secure provider session").font(.caption.bold()).foregroundStyle(.secondary)}
+            if browserVisible,let url=browserURL {
+                VStack(alignment:.leading,spacing:10){
+                    Text(string(model.recoveryJob,"title")).font(.headline)
+                    Text("Sign in yourself, then use the provider’s download button. WebKit keeps this site session inside Tracker Player for later downloads.").font(.callout)
+                    AuthenticatedBrowser(sourceURL:url,completed:{file in model.attachBrowserDownload(model.recoveryJob,file:file)},failed:{message in model.failure=message})
+                        .frame(minWidth:900,minHeight:570)
+                }
+            } else {
+                Text("Resolve source access").font(.title2.bold())
+                Text(string(model.recoveryJob,"title")).font(.headline)
+                Text(string(model.recoveryInfo,"message")).fixedSize(horizontal:false,vertical:true)
+                Text("Your password and WebKit session stay out of transfer logs and the Python engine. Tracker Player receives only the completed file you chose to download.").font(.caption).foregroundStyle(.secondary)
+                HStack{Button("Sign in and download in app"){browserVisible=true}.buttonStyle(.borderedProminent);Button("Open in default browser"){model.openSource(string(model.recoveryInfo,"url"))}}
+                HStack{Button("Retry public download"){Task{await model.perform("retry",["id":string(model.recoveryJob,"id")]);model.showRecovery=false}};Button("Attach a file already downloaded…"){model.attachDownload(model.recoveryJob)}}
+            }
             Divider()
-            HStack{Button("Back · keep unresolved"){model.showRecovery=false};Spacer();Button("Cannot resolve · create placeholder"){Task{await model.perform("mark_unresolved",["id":string(model.recoveryJob,"id")]);model.showRecovery=false}}}
-        }.padding(26).frame(width:620)
+            HStack{Spacer();Button("Cannot resolve · create placeholder"){Task{await model.perform("mark_unresolved",["id":string(model.recoveryJob,"id")]);model.showRecovery=false}}}
+        }.padding(26).frame(minWidth:browserVisible ? 950:620)
     }
 }
 
@@ -32,6 +44,7 @@ struct TransferJobView:View {
                     HStack{Button("Resolve / Sign in…"){Task{await model.recoverSource(job)}};Button("Placeholder"){Task{await model.perform("mark_unresolved",["id":string(job,"id")])}}}.controlSize(.small)
                 }
                 if ["failed","cancelled","interrupted","placeholder","awaiting_access","metadata_failed"].contains(state){Button("Retry this row"){Task{await model.perform("retry",["id":string(job,"id")])}}}
+                if ["completed","skipped","metadata_failed"].contains(state){Button("Save a copy…"){model.saveCopy(job)}.controlSize(.small)}
             }.frame(maxWidth:.infinity,alignment:.leading)
             VStack(alignment:.trailing,spacing:6){Pill(text:state.replacingOccurrences(of:"_",with:" ").uppercased());Text(gigabytes(number(job,"bytes"))+" / "+(number(job,"total")>0 ? gigabytes(number(job,"total")):"size unknown")).font(.caption).monospacedDigit()}
         }.padding(16).background(Color.white.opacity(0.035),in:RoundedRectangle(cornerRadius:12))
