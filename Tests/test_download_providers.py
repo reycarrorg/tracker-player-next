@@ -36,10 +36,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
             requested=self.headers.get('Range','')
             if requested:
                 offset=int(requested.split('=')[1].split('-')[0]);rest=PAYLOAD[offset:]
-                self.send_payload(rest,status=206,extra={'Content-Range':f'bytes {offset}-{len(PAYLOAD)-1}/{len(PAYLOAD)}'});return
+                self.send_payload(rest,status=206,extra={'Content-Range':f'bytes {offset}-{len(PAYLOAD)-1}/{len(PAYLOAD)}','ETag':'"fixture-v1"'});return
             halfway=len(PAYLOAD)//2
-            self.send_response(200);self.send_header('Content-Type','audio/wav');self.send_header('Content-Length',str(len(PAYLOAD)));self.end_headers()
+            self.send_response(200);self.send_header('Content-Type','audio/wav');self.send_header('Content-Length',str(len(PAYLOAD)));self.send_header('ETag','"fixture-v1"');self.end_headers()
             self.wfile.write(PAYLOAD[:halfway]);self.wfile.flush();self.connection.shutdown(1);return
+        if self.path=='/partial206':self.send_payload(PAYLOAD[:len(PAYLOAD)//2],status=206,extra={'Content-Range':f'bytes 0-{len(PAYLOAD)//2-1}/{len(PAYLOAD)}'});return
         self.send_payload(b'missing',status=404,content_type='text/plain')
 
 
@@ -94,6 +95,8 @@ class ProviderFixtureTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code,'cancelled');self.assertTrue(self.path.exists())
     def test_executable_payload_is_rejected(self):
         with self.assertRaises(transport.MediaError):self.download('/executable')
+    def test_unsolicited_partial_response_is_rejected(self):
+        with self.assertRaises(transport.AccessError):self.download('/partial206')
 
 
 if __name__=='__main__':unittest.main()

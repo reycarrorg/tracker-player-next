@@ -5,8 +5,8 @@
 Tracker Player keeps its authored, DNS-pinned public HTTPS transport behind the
 small `DownloadProvider` boundary in `download_providers.py`. Ordinary links are
 tried in stable easiest-first order. Interrupted direct transfers make at most
-three attempts and use a validated HTTP Range response to resume within that
-bounded operation. Existing per-file and batch limits, progress, cancellation,
+three attempts and use a matching strong ETag or Last-Modified validator plus a
+validated HTTP Range response to resume within that bounded operation. Existing per-file and batch limits, progress, cancellation,
 content sniffing, checksum verification, deterministic names, and zero-link
 placeholders remain in force.
 
@@ -53,7 +53,8 @@ dependency and its already-documented redistribution review remain unchanged.
 
 - Production public transfers accept only public HTTPS on port 443, reject URL
   user info, pin validated public DNS results per redirect, and revalidate every
-  redirect.
+  redirect. The same public-DNS check runs again immediately before an auth
+  source is handed to WebKit.
 - The in-app top-level browser and download redirects accept HTTPS domain names,
   reject user info, nonstandard ports, localhost, `.local`, and literal IP hosts.
   WebKit subresource networking remains WebKit-controlled.

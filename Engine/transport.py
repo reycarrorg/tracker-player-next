@@ -144,28 +144,36 @@ def download(url,path,limit,consume=lambda n:None,cancel=lambda:False,progress=l
     for depth in range(3):
         page_resolved=False
         last_network_error=None
+        expected_total=None
+        resume_validator=None
         for attempt in range(max(1,max_attempts)):
             if cancel():raise AccessError('cancelled','Cancelled.')
             if time.monotonic()>deadline:raise AccessError('network_failure','Transfer time limit reached; retry explicitly.')
             if path.exists() and (path.is_symlink() or not path.is_file()):raise MediaError('Download destination must be a regular file.')
             offset=path.stat().st_size if path.exists() else 0
             if offset>limit:raise FileLimit(limit,offset)
-            headers={'Range':f'bytes={offset}-'} if offset else {}
+            if offset and not resume_validator:
+                path.unlink();offset=0
+            headers={'Range':f'bytes={offset}-','If-Range':resume_validator[1]} if offset and resume_validator else {}
             conn=None
             try:
                 conn,r,final=opener(url,headers)
                 status=getattr(r,'status',200)
                 content_length=int(r.getheader('Content-Length') or 0)
                 header=r.getheader('Content-Type','').split(';')[0].lower()
+                if not offset and status!=200:raise AccessError('access_unavailable','Unexpected partial response without a Range request.')
                 if not offset and content_length>limit and header!='text/html':raise FileLimit(limit,content_length)
                 if offset:
                     resume_total=_resume_total(r.getheader('Content-Range'),offset,content_length) if status==206 else None
-                    if resume_total is None:
-                        conn.close();conn=None;path.unlink();continue
-                    total=resume_total or (offset+content_length if content_length else 0)
+                    validator_matches=r.getheader(resume_validator[0])==resume_validator[1]
+                    if resume_total is None or not validator_matches or (expected_total and resume_total and resume_total!=expected_total):
+                        conn.close();conn=None;path.unlink();expected_total=None;resume_validator=None;continue
+                    total=resume_total or expected_total or (offset+content_length if content_length else 0)
                     with open(path,'rb') as existing:first=existing.read(8192)
                 else:
-                    total=content_length
+                    expected_total=content_length or None;total=content_length
+                    etag=r.getheader('ETag');modified=r.getheader('Last-Modified')
+                    resume_validator=('ETag',etag) if etag and not etag.startswith('W/') else ('Last-Modified',modified) if modified else None
                     first=read_chunk(r,8192,0)
                 if total>limit and header!='text/html':raise FileLimit(limit,total)
                 if not offset and (header=='text/html' or first.lstrip().lower().startswith((b'<!doctype html',b'<html'))):

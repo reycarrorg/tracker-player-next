@@ -10,7 +10,7 @@ Use GitHub private vulnerability reporting if it is enabled. If it is unavailabl
 
 ## Security boundaries
 
-The public download engine rejects local/private network destinations, mixed DNS resolution, nonstandard ports, URL user information, unsafe app-owned paths, symbolic-link destinations, oversized transfers, ambiguous source identities, executable or unrecognized payloads, and unverified file changes. Its redirects are revalidated and resumable transfers require a matching `Content-Range` response. Browser cookies and sessions are never imported into that engine.
+The public download engine rejects local/private network destinations, mixed DNS resolution, nonstandard ports, URL user information, unsafe app-owned paths, symbolic-link destinations, oversized transfers, ambiguous source identities, executable or unrecognized payloads, and unverified file changes. Its redirects are revalidated, the public-DNS check runs again before WebKit opens an auth source, and resumable transfers require a matching strong ETag or Last-Modified validator plus `Content-Range`. Browser cookies and sessions are never imported into that engine.
 
 A provider page that requires legitimate authentication opens in an app-local persistent WebKit data store. The user enters credentials directly into the provider page; the app does not inspect, serialize, log, or export WebKit cookies or tokens. Browser navigation and download redirects require HTTPS domain names and reject user information, nonstandard ports, localhost, `.local`, and literal IP hosts. WebKit controls subresource networking, so a real provider canary remains required. Any browser or manually downloaded file requires explicit row association and is copied without changing the selected original.
 

@@ -42,6 +42,8 @@ class DeliveryMixin:
             parsed=urlsplit(url)
             if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None,443):
                 raise Problem('invalid_source','No safe provider page is available.')
+            try:transport.public_target(url)
+            except Exception as error:raise Problem('invalid_source','The provider page is not a currently verified public HTTPS destination.') from error
             if job['state'] not in ('awaiting_access','failed','placeholder'):raise Problem('stale_job','This transfer no longer needs source recovery.')
             self.job_update(job['id'],state='awaiting_access',code='authentication_required' if request.get('classification')=='authentication_required' else 'access_unavailable')
         return {'url':url,'sessionShared':False,'sessionOwner':'WebKit','message':'Sign in inside Tracker Player, then use the provider’s download control. WebKit keeps the site session for quicker later downloads. Passwords, cookies, and tokens never enter the download engine; only the completed file is handed back for validation and metadata.'}
@@ -199,10 +201,12 @@ class DeliveryMixin:
         parent=target.parent
         if not parent.is_dir() or any(item.is_symlink() for item in (parent,*parent.parents)):
             raise Problem('unsafe_path','The destination folder must exist and cannot use symbolic links.')
-        created=False
+        created=False;parent_fd=None;created_identity=None
         try:
+            parent_fd=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
             with regular_reader(source) as src:
-                fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);created=True
+                fd=os.open(target.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent_fd);created=True
+                opened=os.fstat(fd);created_identity=(opened.st_dev,opened.st_ino)
                 hasher=hashlib.sha256();copied=0
                 with os.fdopen(fd,'wb') as dst:
                     for chunk in iter(lambda:src.read(1048576),b''):
@@ -210,14 +214,24 @@ class DeliveryMixin:
                     dst.flush();os.fsync(dst.fileno())
             if copied!=record['bytes'] or hasher.hexdigest()!=record['checksum']:
                 raise Problem('changed','Saved source changed while copying.')
-            with regular_reader(target) as check:
+            check_fd=os.open(target.name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent_fd)
+            checked=os.fstat(check_fd)
+            if (checked.st_dev,checked.st_ino)!=created_identity:
+                os.close(check_fd);raise Problem('changed','Destination changed before checksum readback.')
+            with os.fdopen(check_fd,'rb') as check:
                 verified=hashlib.sha256()
                 for chunk in iter(lambda:check.read(1048576),b''):verified.update(chunk)
             if verified.hexdigest()!=record['checksum']:raise Problem('copy_checksum','Copied bytes differ from the verified source.')
             return {'path':str(target),'checksum':record['checksum'],'bytes':record['bytes']}
         except BaseException:
-            if created and target.exists() and not target.is_symlink():target.unlink()
+            if created and parent_fd is not None:
+                try:
+                    current=os.stat(target.name,dir_fd=parent_fd,follow_symlinks=False)
+                    if (current.st_dev,current.st_ino)==created_identity:os.unlink(target.name,dir_fd=parent_fd)
+                except OSError:pass
             raise
+        finally:
+            if parent_fd is not None:os.close(parent_fd)
 
     def copy_info(self,p):
         from engine import Problem
