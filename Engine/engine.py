@@ -8,6 +8,7 @@ import shutil, signal, sqlite3, stat, sys, threading, time, unicodedata, uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 import transport
+import download_providers
 from artwork import ArtworkCatalog
 from delivery import DeliveryMixin, classification
 from delivery_metadata import destination, public_record, base_name
@@ -328,7 +329,7 @@ class Engine(DeliveryMixin):
         local=self.local(r['id'])
         if local and not source and not force:
             return {'path':local['path'],'kind':local['kind'],'mode':local['mode'],'notice':'SHA-256 verified','id':r['id']}
-        links=[source] if source else transport.ordered_sources(r['links'])
+        links=[source] if source else download_providers.ordered_sources(r['links'])
         if not links: raise Problem('no_source','This row has no media link. Its tracker fields remain available.')
         approved=0
         if p.get('sizeToken'):
@@ -353,7 +354,7 @@ class Engine(DeliveryMixin):
                 self.trim_cache(min(cache_cap,file_limit+4096),cap=cache_cap)
                 part=contained(self.root/'Cache',key+'.'+uuid.uuid4().hex+'.part')
                 try:
-                    info=transport.download(url,part,file_limit,consume=self.disk_guard,cancel=lambda:self.closing,original_media=True)
+                    info=download_providers.download(url,part,file_limit,consume=self.disk_guard,cancel=lambda:self.closing,original_media=True)
                     if self.closing:raise Problem('closing','Player is shutting down.')
                     self.trim_cache(4096,cap=cache_cap)
                     target=contained(self.root/'Cache',key+'.'+info['extension'])
@@ -446,7 +447,7 @@ class Engine(DeliveryMixin):
             self.trim_cache(8*MIB+4096)
             part=target.with_name(rid+'.'+uuid.uuid4().hex+'.part')
             try:
-                info=transport.download(r['links'][0],part,8*MIB,art=True,consume=self.disk_guard,cancel=lambda:self.closing)
+                info=download_providers.download(r['links'][0],part,8*MIB,art=True,consume=self.disk_guard,cancel=lambda:self.closing)
                 if self.closing:raise Problem('closing','Player is shutting down.')
                 os.replace(part,target);atomic_json(meta,info);return {'path':str(target)}
             except Exception:self.art_failed.add(rid);raise
@@ -518,7 +519,7 @@ class Engine(DeliveryMixin):
                 info.update(bytes=existing['bytes'],checksum=existing['checksum'])
             else:
                 attempts=[];last_error=None
-                for source in transport.ordered_sources(row['links']):
+                for source in download_providers.ordered_sources(row['links']):
                     try:
                         info,asset_lock=self.request_asset(row,part,file_limit,source=source,consume=consume,cancel=lambda:jid in self.cancelled or self.closing,progress=progress,reserve=reserve,release=release)
                         info['sourceAttempts']=attempts;break
@@ -672,7 +673,7 @@ class Engine(DeliveryMixin):
         return {'path':str(path)}
     def session(self,p):self.setpref('session',p);return {'ok':True}
     def handle(self,command,p):
-        allowed={'download_all','retry_batch','source_recovery','mark_unresolved','attach_download','assign_art','artwork_report','shuffle_candidates','boot','query','eras','detail','ids','prepare','unpin','art','enqueue','cancel','retry','activity','stats','verify','detach','relink','export','manifest','session','settings','size_decision','discard_size'}
+        allowed={'download_all','retry_batch','source_recovery','mark_unresolved','attach_download','copy_info','save_copy','assign_art','artwork_report','shuffle_candidates','boot','query','eras','detail','ids','prepare','unpin','art','enqueue','cancel','retry','activity','stats','verify','detach','relink','export','manifest','session','settings','size_decision','discard_size'}
         if command not in allowed:raise Problem('unknown_command','Unsupported client command.')
         if not isinstance(p,dict):raise Problem('invalid_request','Command parameters must be an object.')
         if self.closing:raise Problem('closing','Player is shutting down.')

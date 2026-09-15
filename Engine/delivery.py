@@ -1,7 +1,7 @@
-"""Full-era orchestration, unresolved-source recovery and strict artwork ownership.
+"""Full-era orchestration, source recovery, and strict artwork ownership.
 
-Browser cookies never enter this module. Authenticated downloads are selected by
-the user as regular local files after using the provider's own browser UI.
+Browser cookies remain in WebKit. This module receives only a user-confirmed
+local file after an authenticated browser download finishes.
 """
 import hashlib
 import json
@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 import transport
+import download_providers
 from delivery_metadata import public_record, destination, write_tags, MetadataError
 
 
@@ -35,13 +36,17 @@ class DeliveryMixin:
             job=self.db.execute('SELECT * FROM jobs WHERE id=?',(p['id'],)).fetchone()
             if not job:raise Problem('unknown_job','Unknown transfer.')
             request=self.pref('delivery:'+job['id'],{})
-            url=request.get('source') or next(iter(self.row(job['row_id'])['links']), '')
+            row=self.row(job['row_id']);links=row['links'];index=request.get('sourceIndex',0)
+            if not isinstance(index,int) or index<0 or index>=len(links):index=0
+            url=links[index] if links else ''
             parsed=urlsplit(url)
-            if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password:
+            if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None,443):
                 raise Problem('invalid_source','No safe provider page is available.')
+            try:transport.public_target(url)
+            except Exception as error:raise Problem('invalid_source','The provider page is not a currently verified public HTTPS destination.') from error
             if job['state'] not in ('awaiting_access','failed','placeholder'):raise Problem('stale_job','This transfer no longer needs source recovery.')
             self.job_update(job['id'],state='awaiting_access',code='authentication_required' if request.get('classification')=='authentication_required' else 'access_unavailable')
-        return {'url':url,'sessionShared':False,'message':'Sign in on the provider page in your browser. This downloader cannot read browser cookies. Retry checks the same public source; if it still needs the signed-in session, download there and choose Attach downloaded file. You confirm the file belongs to this exact row.'}
+        return {'url':url,'sessionShared':False,'sessionOwner':'WebKit','message':'Sign in inside Tracker Player, then use the provider’s download control. WebKit keeps the site session for quicker later downloads. Passwords, cookies, and tokens never enter the download engine; only the completed file is handed back for validation and metadata.'}
 
     def mark_unresolved(self,p):
         from engine import Problem
@@ -95,7 +100,9 @@ class DeliveryMixin:
 
     def recovery_failure(self,row,job,error,source='',attempts=None):
         code=classification(error);reason=public_record(str(error))
-        self.setpref('delivery:'+job['id'],{'classification':code,'reason':reason,'source':source,'attempts':public_record(attempts or [])})
+        try:source_index=row['links'].index(source)
+        except (ValueError,AttributeError):source_index=0
+        self.setpref('delivery:'+job['id'],{'classification':code,'reason':reason,'sourceIndex':source_index,'attempts':public_record(attempts or [])})
         if code=='no_source':self.placeholder(row,job['id'],code,reason)
         elif code in ('authentication_required','access_unavailable'):
             self.job_update(job['id'],state='awaiting_access',code=code,error=reason+' Open the provider, attach a manually downloaded file, retry this source, or create a placeholder.')
@@ -129,7 +136,7 @@ class DeliveryMixin:
                 info={k:record[k] for k in ('originalUrl','resolvedUrl','kind','extension','mime') if k in record}
                 info.update(bytes=size,checksum=hashlib.sha256(path.read_bytes()).hexdigest(),deduplicated=True,requestKey=key)
                 return info,mutex
-            info=transport.download(source,path,limit,**kwargs);info['requestKey']=key
+            info=download_providers.download(source,path,limit,**kwargs);info['requestKey']=key
             return info,mutex
         except BaseException:mutex.release();raise
 
@@ -179,6 +186,60 @@ class DeliveryMixin:
             self.recovery_failure(row,job,error);raise
         finally:
             if part.exists():part.unlink()
+
+    def save_copy(self,p):
+        """Copy a verified app-owned download to one explicit user destination."""
+        from engine import Problem,regular_reader,digest
+        with self.lock:
+            job=self.db.execute('SELECT * FROM jobs WHERE id=?',(p.get('id',''),)).fetchone()
+            if not job:raise Problem('unknown_job','Unknown transfer.')
+            record=self.db.execute("SELECT * FROM files WHERE id=? AND state='available'",(job['row_id'],)).fetchone()
+        if not record or not self.local(job['row_id']):raise Problem('missing_file','No verified saved file is available to copy.')
+        source=Path(record['path']);target=Path(p.get('path',''))
+        if not target.is_absolute() or not target.name:raise Problem('invalid_destination','Choose an absolute file destination.')
+        if target.exists():raise Problem('destination_exists','That destination already exists. Choose a new name so nothing is overwritten.')
+        parent=target.parent
+        if not parent.is_dir() or any(item.is_symlink() for item in (parent,*parent.parents)):
+            raise Problem('unsafe_path','The destination folder must exist and cannot use symbolic links.')
+        created=False;parent_fd=None;created_identity=None
+        try:
+            parent_fd=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            with regular_reader(source) as src:
+                fd=os.open(target.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent_fd);created=True
+                opened=os.fstat(fd);created_identity=(opened.st_dev,opened.st_ino)
+                hasher=hashlib.sha256();copied=0
+                with os.fdopen(fd,'wb') as dst:
+                    for chunk in iter(lambda:src.read(1048576),b''):
+                        hasher.update(chunk);copied+=len(chunk);dst.write(chunk)
+                    dst.flush();os.fsync(dst.fileno())
+            if copied!=record['bytes'] or hasher.hexdigest()!=record['checksum']:
+                raise Problem('changed','Saved source changed while copying.')
+            check_fd=os.open(target.name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent_fd)
+            checked=os.fstat(check_fd)
+            if (checked.st_dev,checked.st_ino)!=created_identity:
+                os.close(check_fd);raise Problem('changed','Destination changed before checksum readback.')
+            with os.fdopen(check_fd,'rb') as check:
+                verified=hashlib.sha256()
+                for chunk in iter(lambda:check.read(1048576),b''):verified.update(chunk)
+            if verified.hexdigest()!=record['checksum']:raise Problem('copy_checksum','Copied bytes differ from the verified source.')
+            return {'path':str(target),'checksum':record['checksum'],'bytes':record['bytes']}
+        except BaseException:
+            if created and parent_fd is not None:
+                try:
+                    current=os.stat(target.name,dir_fd=parent_fd,follow_symlinks=False)
+                    if (current.st_dev,current.st_ino)==created_identity:os.unlink(target.name,dir_fd=parent_fd)
+                except OSError:pass
+            raise
+        finally:
+            if parent_fd is not None:os.close(parent_fd)
+
+    def copy_info(self,p):
+        from engine import Problem
+        with self.lock:
+            job=self.db.execute('SELECT * FROM jobs WHERE id=?',(p.get('id',''),)).fetchone()
+            record=self.db.execute("SELECT * FROM files WHERE id=? AND state='available'",(job['row_id'],)).fetchone() if job else None
+        if not job or not record or not self.local(job['row_id']):raise Problem('missing_file','No verified saved file is available to copy.')
+        return {'suggestedName':Path(record['path']).name,'bytes':record['bytes'],'checksum':record['checksum']}
 
     def delivery_art(self,row):
         assignments=self.pref('artAssignments',{})

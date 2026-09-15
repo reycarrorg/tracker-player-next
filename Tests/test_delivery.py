@@ -75,12 +75,19 @@ class DeliveryTests(unittest.TestCase):
     def test_auth_open_retry_and_unresolved_same_source(self):
         j=self.e.enqueue({'ids':['auth']})['jobs'][0]
         with patch('transport.download',side_effect=transport.AccessError('authentication_required','Sign in.')):self.e.run_job(j)
-        opened=self.e.source_recovery({'id':j});self.assertEqual(opened['url'],'https://example.com/sign-in');self.assertFalse(opened['sessionShared'])
+        with patch('transport.public_target',return_value=(None,'93.184.216.34')):opened=self.e.source_recovery({'id':j})
+        self.assertEqual(opened['url'],'https://example.com/sign-in');self.assertFalse(opened['sessionShared'])
         self.e.retry({'id':j})
         with patch('transport.download',side_effect=transport.AccessError('authentication_required','Still requires browser session.')):self.run_pending()
         result=self.e.mark_unresolved({'id':j});text=Path(result['path']).read_text()
         self.assertIn('authentication_required',text);self.assertIn('https://example.com/sign-in',text);self.assertIn('sourceHash',text)
         self.assertEqual(self.job(j)['state'],'placeholder')
+    def test_auth_browser_revalidates_public_dns(self):
+        j=self.e.enqueue({'ids':['auth']})['jobs'][0]
+        with patch('transport.download',side_effect=transport.AccessError('authentication_required','Sign in.')):self.e.run_job(j)
+        with patch('transport.public_target',side_effect=transport.MediaError('Private destination.')):
+            with self.assertRaises(engine.Problem) as blocked:self.e.source_recovery({'id':j})
+        self.assertEqual(blocked.exception.code,'invalid_source')
     def test_manual_attachment_preserves_original_and_writes_tags(self):
         j=self.e.enqueue({'ids':['auth']})['jobs'][0]
         with patch('transport.download',side_effect=transport.AccessError('authentication_required','Sign in.')):self.e.run_job(j)
@@ -134,6 +141,23 @@ class DeliveryTests(unittest.TestCase):
         with self.e.transaction():self.e.event('source_failure','a',{'source':signed,'session':'private'})
         manifest=Path(self.e.manifest({})['path']).read_text()
         self.assertNotIn('do-not-export',manifest);self.assertNotIn('private',manifest);self.assertNotIn('session',manifest)
+    def test_recovery_preference_retains_link_index_not_signed_url(self):
+        signed='https://example.com/file?token=do-not-retain&signature=private'
+        signed_row=dict(self.rows[0],links=[signed])
+        with patch.object(self.e,'row',return_value=signed_row),patch('transport.download',side_effect=transport.AccessError('authentication_required','Sign in.')):
+            job=self.e.enqueue({'ids':['a']})['jobs'][0];self.e.run_job(job)
+            raw=self.e.db.execute('SELECT payload FROM preferences WHERE key=?',('delivery:'+job,)).fetchone()[0]
+            self.assertNotIn('do-not-retain',raw);self.assertNotIn('private',raw);self.assertEqual(json.loads(raw)['sourceIndex'],0)
+            with patch('transport.public_target',return_value=(None,'93.184.216.34')):self.assertEqual(self.e.source_recovery({'id':job})['url'],signed)
+    def test_verified_download_can_be_copied_without_overwrite(self):
+        job=self.e.enqueue({'ids':['a']})['jobs'][0]
+        with patch('transport.download',side_effect=self.fake):self.e.run_job(job)
+        info=self.e.copy_info({'id':job});target=self.base/info['suggestedName']
+        copied=self.e.save_copy({'id':job,'path':str(target)})
+        self.assertEqual(engine.digest(target),copied['checksum'])
+        with self.assertRaises(engine.Problem):self.e.save_copy({'id':job,'path':str(target)})
+        real=self.base/'real';real.mkdir();alias=self.base/'alias';alias.symlink_to(real,target_is_directory=True)
+        with self.assertRaises(engine.Problem):self.e.save_copy({'id':job,'path':str(alias/'copy.wav')})
     def test_art_precedence_and_group_uniqueness(self):
         image=self.base/'cover.png';image.write_bytes(PNG)
         self.e.assign_art({'rowId':'a','path':str(image),'scope':'group'})
